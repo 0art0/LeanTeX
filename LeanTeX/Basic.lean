@@ -161,12 +161,120 @@ where
     | .num base _ => base
     | name => name
 
+/-! ### Subexpression tracking
+
+When `Config.tagSubexprs` is set, `latexPP` tries to work out where the expression it is given
+sits inside the root expression, so that the output can be made interactive. This is done
+implicitly, so that pretty printers do not need to know about it: `latexPP e` searches for `e` in
+`Config.expr?` (the nearest enclosing expression that was located), first by pointer equality
+and then structurally. Expressions that pretty printers build themselves (for example `Ne a b`
+from `¬(a = b)`) are not found, but their subexpressions still are, since the search scope
+stays at the nearest located ancestor. If an expression occurs more than once, we use
+the leftmost occurrence that was not already used.
+
+Binder bodies are instantiated with free variables before being printed (see
+`withBindingBodyUnusedName`), so the search also substitutes these free variables when comparing
+against the bodies of binders that are being printed. -/
+
+/-- Implementation of `exprPtrEq`. -/
+private unsafe def exprPtrEqUnsafe (a b : Expr) : Bool := ptrEq a b
+
+/-- Pointer equality of expressions. (As usual with pointer equality, a `false` result means
+nothing.) -/
+@[implemented_by exprPtrEqUnsafe]
+private opaque exprPtrEq (a b : Expr) : Bool
+
+/-- Pre-order (so, leftmost-first) search of `t`, which is at position `p`, for a subexpression
+satisfying `isMatch`, which is also passed the free variables substituted for the loose bound
+variables of the subexpression (innermost last), where known.
+Positions are as in `Lean.SubExpr.Pos`; in particular, `mdata` does not count as a step. -/
+private partial def findPosAux (binders : Array (SubExpr.Pos × Expr)) (ok : SubExpr.Pos → Bool)
+    (isMatch : Expr → Array (Option Expr) → Bool) (t : Expr) (p : SubExpr.Pos)
+    (fvars : Array (Option Expr)) : Option SubExpr.Pos :=
+  if !t.isMData && ok p && isMatch t fvars then
+    some p
+  else
+    match t with
+    | .app f a => go f p.pushAppFn fvars <|> go a p.pushAppArg fvars
+    | .lam _ d b _ | .forallE _ d b _ =>
+      go d p.pushBindingDomain fvars
+        <|> go b p.pushBindingBody (fvars.push <| binders.find? (·.1 == p) |>.map (·.2))
+    | .letE _ ty v b _ =>
+      go ty p.pushLetVarType fvars <|> go v p.pushLetValue fvars
+        <|> go b p.pushLetBody (fvars.push none)
+    | .mdata _ e => go e p fvars
+    | .proj _ _ e => go e p.pushProj fvars
+    | _ => none
+where
+  go := findPosAux binders ok isMatch
+
+/-- Whether `t`, whose loose bound variables are to be replaced by `fvars` (innermost last),
+is structurally equal to `e`. -/
+private def matchesInstantiated (e t : Expr) (fvars : Array (Option Expr)) : Bool :=
+  if !t.hasLooseBVars then
+    t == e
+  else if t.approxDepth != e.approxDepth then
+    false
+  else
+    -- Only the innermost binders with known free variables can be substituted.
+    let known := (fvars.toList.reverse.takeWhile Option.isSome).reverse.filterMap id
+    if t.looseBVarRange > known.length then
+      false
+    else
+      t.instantiateRev known.toArray == e
+
+/-- Find the position of `e` in the current search scope (see `Config.expr?`).
+Unless `allowUsed` is set, positions that were already used by `latexPP` are skipped. -/
+def findSubexprPos (e : Expr) (allowUsed : Bool := false) : LatexPrinterM (Option SubExpr.Pos) := do
+  let cfg ← read
+  let some root := cfg.expr? | return none
+  let used := (← get).usedPos
+  let ok (p : SubExpr.Pos) : Bool := allowUsed || !used.contains p.asNat
+  if let some (_, p) := cfg.knownPos.find? (fun (e', p) => exprPtrEq e e' && ok p) then
+    return p
+  let find := findPosAux cfg.binderFVars ok (t := root) (p := cfg.pos) (fvars := #[])
+  return find (fun t _ => exprPtrEq t e) <|> find (matchesInstantiated e)
+
+/-- Run `m` with `e` (found at `pos`) as the scope for subexpression searches. -/
+def withSubexprScope (e : Expr) (pos : SubExpr.Pos) (m : LatexPrinterM α) : LatexPrinterM α :=
+  withReader (fun cfg => { cfg with pos, expr? := e, binderFVars := #[] }) m
+
+/-- If subexpression tracking is enabled and `e` can be located, run `m` with `e` as
+the search scope and tag its result. Otherwise just run `m`. -/
+def withSubexprTag (e : Expr) (m : LatexPrinterM LatexData) : LatexPrinterM LatexData := do
+  -- `mdata` has no position of its own, so we let the expression inside it be tagged instead.
+  unless (← read).tagSubexprs && !e.isMData do return ← m
+  let some pos ← findSubexprPos e | m
+  let tag := (← get).tags.size
+  let lctx ← getLCtx
+  modify fun s => { s with
+    tags := s.tags.push { expr := e, pos, lctx }
+    usedPos := s.usedPos.insert pos.asNat }
+  return .Tagged tag (← withSubexprScope e pos m)
+
+/-- Runs `x`, and if it fails, restores the printer state and runs `y`.
+Used when trying pretty printers, so that subexpressions used by a failed printer are not
+considered used. -/
+def tryOrElse (x : LatexPrinterM α) (y : Unit → LatexPrinterM α) : LatexPrinterM α := do
+  let s ← get
+  try x catch _ => set s; y ()
+
+/-- Run `d` for the body `body` of the binder `e`, where `fvar` was substituted for the bound
+variable, recording the position of `body` for subexpression tracking. -/
+private def withBindingBodyPos (e fvar body : Expr) (d : LatexPrinterM α) : LatexPrinterM α := do
+  unless (← read).tagSubexprs do return ← d
+  let some pos ← findSubexprPos e (allowUsed := true) | d
+  withReader (fun cfg => { cfg with
+    binderFVars := cfg.binderFVars.push (pos, fvar)
+    knownPos := cfg.knownPos.push (body, pos.pushBindingBody) }) d
+
 /-- Given an `Expr` that is a `.forallE` or `.lam`, execute the given `d` in the context of a
 local declaration. The function `d` is provided the name of the new local and its type.  -/
 def withBindingBodyUnusedName (e : Expr) (d : Name → Expr → LatexPrinterM α) : LatexPrinterM α := do
   let n ← getUnusedName e.bindingName! e.bindingBody!
-  Meta.withLocalDecl n e.binderInfo e.bindingDomain! fun fvar =>
-    d n (e.bindingBody!.instantiate1 fvar)
+  Meta.withLocalDecl n e.binderInfo e.bindingDomain! fun fvar => do
+    let body := e.bindingBody!.instantiate1 fvar
+    withBindingBodyPos e fvar body (d n body)
 
 /-- Given an expression that is a function, ensure it is an `Expr.lam` by doing 1-variable
 eta expansion as needed.
@@ -227,24 +335,81 @@ partial def latexPPFor (e : Expr) (kind : Name) : LatexPrinterM LatexData := do
   if kind.isAnonymous then
     failure
   for pp in latexPPAttribute.getValues (← getEnv) kind do
+    let s ← get
     try
       return ← pp e
-    catch _ => pure ()
+    catch _ => set s
   if kind.getRoot != kind then
     latexPPFor e kind.getRoot
   else
     failure
 
 /-- Runs the pretty printer for `e` using the `latexPPFor` algorithm with kind `getExprKind e`,
-and if this fails it runs `defaultLatexPP`. -/
+and if this fails it runs `defaultLatexPP`.
+
+If `Config.tagSubexprs` is set, the result is tagged with the position of `e`
+(see `withSubexprTag`). -/
 def latexPP (e : Expr) : LatexPrinterM LatexData :=
-  latexPPFor e (getExprKind e) <|> defaultLatexPP e
+  withSubexprTag e <| tryOrElse (latexPPFor e (getExprKind e)) fun _ => defaultLatexPP e
 
 /-- Run the LaTeX pretty printer for the expression `e`, using the given configuration. -/
 def run_latexPP (e : Expr) (config : Config) : MetaM String := do
   let pp : LatexPrinterM LatexData := latexPP e
   let data : LatexData ← (pp.run config).run' {}
   return data.latex.1
+
+/-- Like `run_latexPP`, but with subexpression tracking. The LaTeX marks the output for each
+located subexpression with `tagLatex`, and the returned array gives the subexpression for each tag.
+Use `parseTaggedLatex` to turn the LaTeX into `TaggedText`. -/
+def run_latexPPTagged (e : Expr) (config : Config) : MetaM (String × Array SubexprTag) := do
+  let pp : LatexPrinterM LatexData := latexPP e
+  let config := { config with tagSubexprs := true, expr? := e, pos := .root }
+  let (data, s) ← (pp.run config).run {}
+  return (data.latex.1, s.tags)
+
+/-- Parse LaTeX produced by `run_latexPPTagged`, turning the `tagLatex` markers into tags.
+Leaves are LaTeX fragments. Removing the tags (with `TaggedText.stripTags`) gives the same LaTeX
+as `run_latexPP`. -/
+partial def parseTaggedLatex (s : String) : Widget.TaggedText Nat :=
+  let cs := s.toList.toArray
+  (go cs 0 #[] "").1
+where
+  /-- The `tagLatex` prefix. -/
+  marker : List Char := "\\class{lean-se-".toList
+  /-- Whether `marker` occurs at position `i`. -/
+  isMarkerAt (cs : Array Char) (i : Nat) : Bool :=
+    marker.length + i ≤ cs.size && (List.range marker.length).all fun j => cs[i + j]! == marker[j]!
+  /-- Collect the current text into `acc`. -/
+  flush (acc : Array (Widget.TaggedText Nat)) (text : String) : Array (Widget.TaggedText Nat) :=
+    if text.isEmpty then acc else acc.push (.text text)
+  /-- Combine the parts of a group. -/
+  mk (acc : Array (Widget.TaggedText Nat)) : Widget.TaggedText Nat :=
+    if h : acc.size = 1 then acc[0] else .append acc
+  /-- Parse from position `i` until the end of the current tag, given by an unmatched `}`.
+  Returns the parsed text and the position after the `}`. `depth` counts open braces. -/
+  go (cs : Array Char) (i : Nat) (acc : Array (Widget.TaggedText Nat)) (text : String)
+      (depth : Nat := 0) : Widget.TaggedText Nat × Nat :=
+    if h : i < cs.size then
+      let c := cs[i]
+      if isMarkerAt cs i then
+        -- `\class{lean-se-N}{`
+        let digits := (cs.extract (i + marker.length) cs.size).toList.takeWhile Char.isDigit
+        let tag := String.ofList digits |>.toNat!
+        let (inner, j) := go cs (i + marker.length + digits.length + 2) #[] ""
+        go cs j ((flush acc text).push (.tag tag inner)) "" depth
+      else if c == '\\' && i + 1 < cs.size then
+        go cs (i + 2) acc (text.push c |>.push cs[i + 1]!) depth
+      else if c == '{' then
+        go cs (i + 1) acc (text.push c) (depth + 1)
+      else if c == '}' then
+        if depth == 0 then
+          (mk (flush acc text), i + 1)
+        else
+          go cs (i + 1) acc (text.push c) (depth - 1)
+      else
+        go cs (i + 1) acc (text.push c) depth
+    else
+      (mk (flush acc text), i)
 
 /-- Pretty prints an expression that is a function application using the printers tagged with the
 `latex_pp_app` attribute for the specified kind. If they fail, tries using `kind.getRoot` and
@@ -253,9 +418,10 @@ partial def latexPPAppFor (kind : Name) (f : Expr) (args : Array Expr) (pkinds :
   if kind.isAnonymous then
     failure
   for pp in latexPPAppAttribute.getValues (← getEnv) kind do
+    let s ← get
     try
       return ← pp f args pkinds
-    catch _ => pure ()
+    catch _ => set s
   if kind.getRoot != kind then
     latexPPAppFor kind.getRoot f args pkinds
   else if kind != `any then

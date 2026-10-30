@@ -26,9 +26,42 @@ structure Config where
   /-- Whether to allow binders to shadow names in the local context, provided that the local variables
   they shadow do not appear within the body of the forall/lambda. -/
   allowShadowing : Bool := true
+  /-- Whether to record which subexpression each part of the output comes from, for interactive
+  display. When this is set, `latexPP` wraps its result in `LatexData.Tagged`.
+  See `LeanTeX.run_latexPPTagged`. -/
+  tagSubexprs : Bool := false
+  /-- Subexpression tracking: the position (in the root expression being printed) of the nearest
+  enclosing expression that `latexPP` was able to locate. -/
+  pos : SubExpr.Pos := .root
+  /-- Subexpression tracking: the expression at `pos`. Expressions passed to `latexPP` are searched
+  for in this expression. If `none`, no tracking happens. -/
+  expr? : Option Expr := none
+  /-- Subexpression tracking: binders inside `expr?` (given by position) whose bodies are being
+  printed, along with the free variable that was substituted for the bound variable.
+  This lets us find subexpressions of instantiated binder bodies. -/
+  binderFVars : Array (SubExpr.Pos × Expr) := #[]
+  /-- Subexpression tracking: expressions whose positions are known explicitly
+  (compared using pointer equality). Used for instantiated binder bodies. -/
+  knownPos : Array (Expr × SubExpr.Pos) := #[]
 
+/-- A subexpression that was located while pretty printing, recorded for interactive display. -/
+structure SubexprTag where
+  /-- The subexpression. -/
+  expr : Expr
+  /-- Its position in the root expression. -/
+  pos : SubExpr.Pos
+  /-- The local context in which `expr` makes sense. -/
+  lctx : LocalContext
+  deriving Inhabited
+
+/-- State for the `LatexPrinterM` monad. -/
 structure State where
-
+  /-- Subexpressions that have been tagged so far. Indices into this array are the tags
+  used by `LatexData.Tagged`. -/
+  tags : Array SubexprTag := #[]
+  /-- Positions (as `SubExpr.Pos.asNat`) that have already been assigned to a call to `latexPP`.
+  When an expression occurs more than once, this lets us choose the leftmost unused occurrence. -/
+  usedPos : Std.HashSet Nat := {}
 deriving Inhabited
 
 /-- Monad for the entire LaTeX math expression pretty printer. Extends `MetaM` with some
@@ -97,22 +130,36 @@ inductive LatexData where
   | Atom (latex : String) (bigness : Nat := 0) (sup? : Option LatexData) (sub? : Option LatexData)
   /-- anything that is a row of operators and operands -/
   | Row (latex : String) (lbp : BP) (rbp : BP) (bigness : Nat)
+  /-- `data` printed from the subexpression with the given tag (an index into `State.tags`).
+  Behaves exactly like `data`, except that `LatexData.latex` marks the output with `tagLatex`.
+  These are created by `latexPP` when `Config.tagSubexprs` is set. -/
+  | Tagged (tag : Nat) (data : LatexData)
 deriving Inhabited
+
+/-- Marks a piece of LaTeX as coming from the subexpression with the given tag.
+This is the MathJax `\class` command, which `LeanTeX.parseTaggedLatex` turns back into tags. -/
+def tagLatex (tag : Nat) (s : String) : String :=
+  s!"\\class\{lean-se-{tag}}\{{s}}"
 
 /-- The effective left binding power. For a `LatexData.Atom`, this is infinity. -/
 def LatexData.lbp : LatexData → BP
 | Atom .. => BP.Infinity
 | Row _ lbp _ _ => lbp
+| Tagged _ d => d.lbp
 
 /-- The effective right binding power. For a `LatexData.Atom`, this is infinity. -/
 def LatexData.rbp : LatexData → BP
 | Atom .. => BP.Infinity
 | Row _ _ rbp _ => rbp
+| Tagged _ d => d.rbp
 
 /-- Return a string representation of a `LatexData` along with its bigness.
 For example, with a `LatexData.Atom`, this is the algorithm that finally encodes
 the superscript and subscript expressions as LaTeX. -/
 def LatexData.latex : LatexData → String × Nat
+| Tagged tag d =>
+  let (latex, bigness) := d.latex
+  (tagLatex tag latex, bigness)
 | Atom latex bigness sup? sub? =>
   let (latex, bigness) :=
     if let some sup := sup? then
@@ -132,6 +179,7 @@ returns the original data otherwise. -/
 def LatexData.maybeWithTooltip : LatexData → String → LatexPrinterM LatexData
   | Atom latex bigness sup? sub?, tooltip => do return Atom (← LeanTeX.maybeWithTooltip latex tooltip) bigness sup? sub?
   | Row latex lbp rbp bigness, tooltip => do return Row (← LeanTeX.maybeWithTooltip latex tooltip) lbp rbp bigness
+  | Tagged tag d, tooltip => do return Tagged tag (← d.maybeWithTooltip tooltip)
 
 /-- Put parentheses around a string, using positivity of the `bigness` value to determine 
 whether or not to use `\left` and `\right` to get appropriate sizing. (Note that we do this
@@ -154,6 +202,7 @@ def wrapBrackets (s : String) (bigness : Nat) : String :=
 def LatexData.toAtom : LatexData → LatexData
 | d@(Atom ..) => d
 | Row latex _lbp _rbp bigness => Atom (wrapParens latex bigness) bigness none none
+| Tagged tag d => Tagged tag d.toAtom
 
 /-- Ensure the latex data is a `Row`. If it was an `Atom`, we set the binding powers to infinity. -/
 def LatexData.toRow : LatexData → LatexData
@@ -161,6 +210,7 @@ def LatexData.toRow : LatexData → LatexData
   let (latex, bigness) := d.latex
   Row latex .Infinity .Infinity bigness
 | d@(Row ..) => d
+| Tagged tag d => Tagged tag d.toRow
 
 /-- Wrap the latex data in parentheses and make it an `Atom`.
 (This is different from `LatexData.toAtom` because this one *always* wraps in parentheses.)
@@ -179,6 +229,12 @@ will always be an `Atom`. -/
 def LatexData.sup (d s : LatexData) : LatexData :=
   match d with
   | Atom latex bigness none sub? => Atom latex bigness (some s) sub?
+  | Tagged tag d =>
+    -- The tag applies to everything but the new superscript, so push it into the base and
+    -- the existing subscript. This keeps the output the same as without tags.
+    match d.sup s with
+    | Atom latex bigness sup? sub? => Atom (tagLatex tag latex) bigness sup? (sub?.map (Tagged tag))
+    | d' => d'
   | _ => d.parens s none
 
 /-- Attach a subscript, adding parentheses if necessary. In particular the result
@@ -186,6 +242,11 @@ will always be an `Atom`. -/
 def LatexData.sub (d s : LatexData) : LatexData :=
   match d with
   | Atom latex bigness sup? none => Atom latex bigness sup? s
+  | Tagged tag d =>
+    -- See `LatexData.sup`.
+    match d.sub s with
+    | Atom latex bigness sup? sub? => Atom (tagLatex tag latex) bigness (sup?.map (Tagged tag)) sub?
+    | d' => d'
   | _ => d.parens none s
 
 /-- Add parentheses if needed given that there is something with binding
@@ -219,6 +280,7 @@ def LatexData.bigger (d : LatexData) (extra_bigness : Nat := 1) : LatexData :=
   match d with
   | Atom latex bigness sup? sub? => Atom latex (bigness + extra_bigness) sup? sub?
   | Row latex lbp rbp bigness => Row latex lbp rbp (bigness + extra_bigness)
+  | Tagged tag d => Tagged tag (d.bigger extra_bigness)
 
 /-- A string as a `LatexData`, represented as a `Row` with given binding powers.
 (Note that this means it will be parenthesized if it gets a superscript or subscript.) -/
