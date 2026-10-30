@@ -1,5 +1,6 @@
 import LeanTeX.Basic
 import ProofWidgets.Component.HtmlDisplay
+import Lean.Server.GoTo
 
 /-! # Widgets for displaying LaTeX
 
@@ -53,20 +54,41 @@ docstring, and shift-clicking selects it. Selection is local to the widget. -/
 def LatexDisplay : Component LatexDisplay.Props where
   javascript := include_str ".." / "widget" / "dist" / "latexDisplay.js"
 
-/-- The infoview information for a tagged subexpression. For applications of constants, the hover
-shows the constant's docstring. -/
-def SubexprTag.toInfo (t : SubexprTag) : MetaM Elab.Info := do
-  let doc? ← match t.expr.getAppFn.constName? with
-    | some c => if t.expr.isApp then findDocString? (← getEnv) c else pure none
-    | none => pure none
-  return .ofDelabTermInfo {
-    elaborator := .anonymous
-    stx := .missing
-    lctx := t.lctx
-    expectedType? := none
-    expr := t.expr
-    mkDocString? := doc?.map fun doc _ => pure doc
-    explicit := false }
+/-- The declaration of the constant `c`, for go-to-definition. -/
+def declLocation? (c : Name) : MetaM (Option DeclarationLocation) := do
+  let some ranges ← findDeclarationRanges? c | return none
+  let env ← getEnv
+  let module := match env.getModuleIdxFor? c with
+    | some idx => env.header.moduleNames[idx.toNat]!
+    | none => env.mainModule
+  return some { module, range := ranges.selectionRange }
+
+/-- The infoview information for a tagged subexpression.
+
+For applications of constants, the hover shows the constant's docstring. Go-to-definition works
+as for applications in the goal view: for applications of type class projections such as `a + b`
+it lists the instances, and otherwise it goes to the constant. Since LaTeX notation often does not
+show the function separately (for example `\sqrt{x}`), the latter is done here: the server only
+does it for `Info.ofTermInfo`. -/
+def SubexprTag.toInfo (t : SubexprTag) : MetaM Elab.Info :=
+  Meta.withLCtx t.lctx {} do
+    let mut doc? := none
+    let mut location? := none
+    if let some c := t.expr.getAppFn.constName? then
+      if t.expr.isApp then
+        doc? ← findDocString? (← getEnv) c
+        let isProj ← try pure (← Server.getInstanceProjectionArg? t.expr).isSome catch _ => pure false
+        unless isProj do
+          location? ← declLocation? c
+    return .ofDelabTermInfo {
+      elaborator := .anonymous
+      stx := .missing
+      lctx := t.lctx
+      expectedType? := none
+      expr := t.expr
+      location?
+      mkDocString? := doc?.map fun doc _ => pure doc
+      explicit := false }
 
 /-- Replace the tags (indices into `tags` and `infos`) in the output of `parseTaggedLatex`
 by `SubexprInfo`s. -/

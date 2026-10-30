@@ -43,6 +43,10 @@ structure Config where
   /-- Subexpression tracking: expressions whose positions are known explicitly
   (compared using pointer equality). Used for instantiated binder bodies. -/
   knownPos : Array (Expr × SubExpr.Pos) := #[]
+  /-- Subexpression tracking: positions (as `SubExpr.Pos.asNat`) of arguments that the usual
+  pretty printer hides, that is, implicit and instance arguments. Occurrences inside these are
+  only used if no other occurrence is found. -/
+  hiddenPos : Std.HashSet Nat := {}
 
 /-- A subexpression that was located while pretty printing, recorded for interactive display. -/
 structure SubexprTag where

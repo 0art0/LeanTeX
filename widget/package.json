@@ -5,12 +5,13 @@
   "description": "Infoview widget for LeanTeX's interactive LaTeX display",
   "license": "Apache-2.0",
   "scripts": {
-    "build": "tsc --noEmit && esbuild src/latexDisplay.tsx --bundle --format=esm --target=es2020 --jsx=transform --external:react --external:@leanprover/infoview --outfile=dist/latexDisplay.js",
+    "build": "tsc --noEmit && esbuild src/latexDisplay.tsx --bundle --format=esm --target=es2020 --jsx=transform --external:react --external:react-dom --external:@leanprover/infoview --outfile=dist/latexDisplay.js",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@leanprover/infoview": "~0.11.1",
     "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "esbuild": "^0.28.2",
     "react": "^18.3.1",
     "typescript": "^5.9.3"

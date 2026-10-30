@@ -187,11 +187,14 @@ private opaque exprPtrEq (a b : Expr) : Bool
 /-- Pre-order (so, leftmost-first) search of `t`, which is at position `p`, for a subexpression
 satisfying `isMatch`, which is also passed the free variables substituted for the loose bound
 variables of the subexpression (innermost last), where known.
-Positions are as in `Lean.SubExpr.Pos`; in particular, `mdata` does not count as a step. -/
-private partial def findPosAux (binders : Array (SubExpr.Pos × Expr)) (ok : SubExpr.Pos → Bool)
+Positions are as in `Lean.SubExpr.Pos`; in particular, `mdata` does not count as a step.
+Subexpressions at positions satisfying `skip` are not searched. -/
+private partial def findPosAux (binders : Array (SubExpr.Pos × Expr)) (ok skip : SubExpr.Pos → Bool)
     (isMatch : Expr → Array (Option Expr) → Bool) (t : Expr) (p : SubExpr.Pos)
     (fvars : Array (Option Expr)) : Option SubExpr.Pos :=
-  if !t.isMData && ok p && isMatch t fvars then
+  if skip p then
+    none
+  else if !t.isMData && ok p && isMatch t fvars then
     some p
   else
     match t with
@@ -206,7 +209,7 @@ private partial def findPosAux (binders : Array (SubExpr.Pos × Expr)) (ok : Sub
     | .proj _ _ e => go e p.pushProj fvars
     | _ => none
 where
-  go := findPosAux binders ok isMatch
+  go := findPosAux binders ok skip isMatch
 
 /-- Whether `t`, whose loose bound variables are to be replaced by `fvars` (innermost last),
 is structurally equal to `e`. -/
@@ -224,7 +227,8 @@ private def matchesInstantiated (e t : Expr) (fvars : Array (Option Expr)) : Boo
       t.instantiateRev known.toArray == e
 
 /-- Find the position of `e` in the current search scope (see `Config.expr?`).
-Unless `allowUsed` is set, positions that were already used by `latexPP` are skipped. -/
+Unless `allowUsed` is set, positions that were already used by `latexPP` are skipped.
+Occurrences that the usual pretty printer would show are preferred (see `Config.hiddenPos`). -/
 def findSubexprPos (e : Expr) (allowUsed : Bool := false) : LatexPrinterM (Option SubExpr.Pos) := do
   let cfg ← read
   let some root := cfg.expr? | return none
@@ -232,8 +236,12 @@ def findSubexprPos (e : Expr) (allowUsed : Bool := false) : LatexPrinterM (Optio
   let ok (p : SubExpr.Pos) : Bool := allowUsed || !used.contains p.asNat
   if let some (_, p) := cfg.knownPos.find? (fun (e', p) => exprPtrEq e e' && ok p) then
     return p
-  let find := findPosAux cfg.binderFVars ok (t := root) (p := cfg.pos) (fvars := #[])
-  return find (fun t _ => exprPtrEq t e) <|> find (matchesInstantiated e)
+  -- The scope itself may be inside a hidden argument, so we never skip it.
+  let skipHidden (p : SubExpr.Pos) : Bool := p != cfg.pos && cfg.hiddenPos.contains p.asNat
+  let find (skip : SubExpr.Pos → Bool) :=
+    findPosAux cfg.binderFVars ok skip (t := root) (p := cfg.pos) (fvars := #[])
+  return find skipHidden (fun t _ => exprPtrEq t e) <|> find skipHidden (matchesInstantiated e)
+    <|> find (fun _ => false) (fun t _ => exprPtrEq t e) <|> find (fun _ => false) (matchesInstantiated e)
 
 /-- Run `m` with `e` (found at `pos`) as the scope for subexpression searches. -/
 def withSubexprScope (e : Expr) (pos : SubExpr.Pos) (m : LatexPrinterM α) : LatexPrinterM α :=
@@ -358,12 +366,43 @@ def run_latexPP (e : Expr) (config : Config) : MetaM String := do
   let data : LatexData ← (pp.run config).run' {}
   return data.latex.1
 
+/-- Positions (as `SubExpr.Pos.asNat`) of the arguments in `e` that the usual pretty printer
+hides, namely the non-explicit ones. See `Config.hiddenPos`. -/
+partial def hiddenArgPositions (e : Expr) : MetaM (Std.HashSet Nat) := do
+  let r ← IO.mkRef ({} : Std.HashSet Nat)
+  let rec go (e : Expr) (p : SubExpr.Pos) : MetaM Unit := do
+    match e with
+    | .app .. =>
+      let f := e.getAppFn
+      let args := e.getAppArgs
+      let paramInfo ← try pure (← Meta.getFunInfoNArgs f args.size).paramInfo catch _ => pure #[]
+      go f (p.pushNaryFn args.size)
+      for h : i in [0:args.size] do
+        let p' := p.pushNaryArg args.size i
+        if let some info := paramInfo[i]? then
+          unless info.binderInfo.isExplicit do
+            r.modify (·.insert p'.asNat)
+        go args[i] p'
+    | .lam n d b bi | .forallE n d b bi =>
+      go d p.pushBindingDomain
+      Meta.withLocalDecl n bi d fun x => go (b.instantiate1 x) p.pushBindingBody
+    | .letE n t v b _ =>
+      go t p.pushLetVarType
+      go v p.pushLetValue
+      Meta.withLetDecl n t v fun x => go (b.instantiate1 x) p.pushLetBody
+    | .mdata _ e => go e p
+    | .proj _ _ e => go e p.pushProj
+    | _ => pure ()
+  try go e .root catch _ => pure ()
+  r.get
+
 /-- Like `run_latexPP`, but with subexpression tracking. The LaTeX marks the output for each
 located subexpression with `tagLatex`, and the returned array gives the subexpression for each tag.
 Use `parseTaggedLatex` to turn the LaTeX into `TaggedText`. -/
 def run_latexPPTagged (e : Expr) (config : Config) : MetaM (String × Array SubexprTag) := do
   let pp : LatexPrinterM LatexData := latexPP e
-  let config := { config with tagSubexprs := true, expr? := e, pos := .root }
+  let hiddenPos ← hiddenArgPositions e
+  let config := { config with tagSubexprs := true, expr? := e, pos := .root, hiddenPos }
   let (data, s) ← (pp.run config).run {}
   return (data.latex.1, s.tags)
 

@@ -133,7 +133,7 @@ info: \class{lean-se-0}{\forall y : \class{lean-se-1}{\mathbb{N}},\ \class{lean-
 /1/1/0/0/1 y (inst)
 /1/1/0/1 z (inst)
 /1/1/1 ∃ w, y + w = z (inst)
-/1/1/1/0/1 Nat
+/1/1/1/1/0 Nat
 /1/1/1/1/1 y + w = z (inst)
 /1/1/1/1/1/0/1 y + w (inst)
 /1/1/1/1/1/0/1/0/1 y (inst)
@@ -180,7 +180,7 @@ info: \class{lean-se-0}{\class{lean-se-1}{\mathbb{N}} \times \class{lean-se-2}{(
 / Nat × (n : Nat) × Fin n × Nat
 /0/1 Nat
 /1 (n : Nat) × Fin n × Nat
-/1/0/1 Nat
+/1/1/0 Nat
 /1/1/1 Fin n × Nat (inst)
 /1/1/1/0/1 Fin n (inst)
 /1/1/1/0/1/1 n (inst)
@@ -191,9 +191,9 @@ info: \class{lean-se-0}{\class{lean-se-1}{\mathbb{N}} \times \class{lean-se-2}{(
 /--
 info: \class{lean-se-0}{\exists p : \class{lean-se-1}{\class{lean-se-2}{\mathbb{N}} \times \class{lean-se-3}{\mathbb{N}}},\ \class{lean-se-4}{\class{lean-se-5}{\class{lean-se-6}{\text{Prod.fst}}(\class{lean-se-7}{p})} = \class{lean-se-8}{b}}}
 / ∃ p, p.fst = b
-/0/1 Nat × Nat
-/0/1/0/1 Nat
-/0/1/1 Nat
+/1/0 Nat × Nat
+/1/0/0/1 Nat
+/1/0/1 Nat
 /1/1 p.fst = b (inst)
 /1/1/0/1 p.fst (inst)
 /1/1/0/1/0/0/0 @Prod.fst
