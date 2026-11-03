@@ -1,6 +1,7 @@
 import LeanTeX.Basic
 import ProofWidgets.Component.HtmlDisplay
 import Lean.Server.GoTo
+import Lean.Widget.Diff
 
 /-! # Widgets for displaying LaTeX
 
@@ -49,8 +50,13 @@ structure LatexTag where
   colors these. -/
   fvarId : Option FVarId := none
   /-- Identifies the subexpression up to structural equality (ignoring metadata). On hover, the
-  display highlights the other subexpressions with the same key. -/
+  display highlights the other subexpressions with the same key, also in other formulas. -/
   key : String
+  /-- If the subexpression should be folded (shown as `⋯`) initially, why. As in the usual pretty
+  printer, this follows the options `pp.proofs` and `pp.deepTerms`. See `omissionReason?`. -/
+  omitted : Option String := none
+  /-- How the subexpression changed in the last tactic, for goals (see `LatexDisplay.diff`). -/
+  diff : Option Widget.DiffTag := none
   deriving Server.RpcEncodable
 
 /-- LaTeX whose leaves are LaTeX fragments, with tagged subexpressions. -/
@@ -143,19 +149,52 @@ partial def eraseMData (e : Expr) : Expr :=
     | .mdata _ b => some (eraseMData b)
     | _ => none
 
-/-- The `LatexTag` for a tagged subexpression. -/
-def SubexprTag.toLatexTag (ctx : ContextInfo) (t : SubexprTag) : MetaM LatexTag := do
+/-- Why the subexpression `e`, nested `depth` tags deep in the LaTeX, should be folded initially,
+if it should. Like `Lean.PrettyPrinter.Delaborator.shouldOmitProof` and `shouldOmitExpr`, this
+folds proofs unless `pp.proofs` is set, and deep terms unless `pp.deepTerms` is set, except for
+shallow expressions. The depth of the LaTeX stands in for the delaborator's depth.
+The expression being displayed (at depth 0) is never folded. -/
+def omissionReason? (opts : Options) (e : Expr) (isProof : Bool) (depth : Nat) : Option String :=
+  open PrettyPrinter.Delaborator in
+  if depth == 0 || e.isAtomic then
+    none
+  else if isProof && !getPPProofs opts && !isShallowExpression (getPPProofsThreshold opts) e then
+    some "Proof folded (see option `pp.proofs`)."
+  else
+    let threshold := getPPDeepTermsThreshold opts
+    let excess := depth - threshold
+    if !getPPDeepTerms opts && excess > 0 && !isShallowExpression (threshold / 4 - excess) e then
+      some "Term folded due to its depth (see option `pp.deepTerms`)."
+    else
+      none
+
+/-- The `LatexTag` for a tagged subexpression, which is nested `depth` tags deep. -/
+def SubexprTag.toLatexTag (ctx : ContextInfo) (t : SubexprTag) (depth : Nat) : MetaM LatexTag := do
   let info ← t.toInfo
-  let fvarId ← Meta.withLCtx t.lctx {} do
-    let .fvar fvarId := t.expr | return none
-    let isProof ← try Meta.isProof t.expr catch _ => pure true
-    return if isProof then none else some fvarId
+  let isProof ← Meta.withLCtx t.lctx {} do
+    try Meta.isProof t.expr catch _ => pure false
+  let opts ← getOptions
   return {
     info := ← Server.WithRpcRef.mk { ctx, info, children := .empty }
     subexprPos := t.pos
     binder := t.binder
-    fvarId
-    key := toString (eraseMData t.expr).hash }
+    fvarId := if let .fvar fvarId := t.expr then if isProof then none else some fvarId else none
+    key := toString (eraseMData t.expr).hash
+    omitted := if t.binder then none else omissionReason? opts t.expr isProof depth }
+
+/-- The least depth at which each tag (an index below `n`) occurs in `tt`. -/
+partial def tagDepths (n : Nat) (tt : Widget.TaggedText Nat) : Array Nat :=
+  go tt 0 (.replicate n 0) (.replicate n false) |>.1
+where
+  go (tt : Widget.TaggedText Nat) (depth : Nat) (ds : Array Nat) (seen : Array Bool) :
+      Array Nat × Array Bool :=
+    match tt with
+    | .text _ => (ds, seen)
+    | .append as => as.foldl (fun (ds, seen) a => go a depth ds seen) (ds, seen)
+    | .tag t a =>
+      let (ds, seen) :=
+        if seen[t]?.getD true then (ds, seen) else (ds.set! t depth, seen.set! t true)
+      go a (depth + 1) ds seen
 
 /-- Replace the tags (indices into `tags`) in the output of `parseTaggedLatex` by `LatexTag`s. -/
 partial def tagLatexInfos (tags : Array LatexTag) (tt : Widget.TaggedText Nat) : LatexCode :=
@@ -163,6 +202,18 @@ partial def tagLatexInfos (tags : Array LatexTag) (tt : Widget.TaggedText Nat) :
     match tags[t]? with
     | some tag => .tag tag (tagLatexInfos tags sub)
     | none => tagLatexInfos tags sub
+
+/-- Applies `f` to the tags of `code`. -/
+partial def LatexCode.mapTags (f : LatexTag → LatexTag) : LatexCode → LatexCode
+  | .text s => .text s
+  | .append as => .append (as.map (mapTags f))
+  | .tag t a => .tag (f t) (mapTags f a)
+
+/-- Folds `f` over the tags of `code`. -/
+partial def LatexCode.foldTags (f : α → LatexTag → α) (init : α) : LatexCode → α
+  | .text _ => init
+  | .append as => as.foldl (fun acc a => foldTags f acc a) init
+  | .tag t a => foldTags f (f init t) a
 
 /-- Run the LaTeX pretty printer on `e`, returning the LaTeX with tagged subexpressions.
 Removing the tags gives the same LaTeX as `run_latexPP`. -/
@@ -177,8 +228,10 @@ def latexWithInfos (e : Expr) (config : Config := {}) : MetaM LatexCode := do
     fileMap       := default
     ngen          := (← getNGen)
   }
-  let tags ← tags.mapM (·.toLatexTag ctx)
-  return tagLatexInfos tags (parseTaggedLatex latex)
+  let tt := parseTaggedLatex latex
+  let depths := tagDepths tags.size tt
+  let tags ← tags.mapIdxM fun i t => t.toLatexTag ctx depths[i]!
+  return tagLatexInfos tags tt
 
 /-- The contents of the hover for a subexpression in a `LatexDisplay`, like `Lean.Widget.InfoPopup`
 but with the expression and its type in LaTeX. -/
@@ -270,6 +323,148 @@ def goalLatexLines (mvarId : MVarId) : MetaM (Array (Array LatexPart)) := mvarId
 /--
 Tactic for displaying the goal in LaTeX form.
 -/
-elab tk:"texify" : tactic => withMainContext do
+elab (name := texifyTac) tk:"texify" : tactic => withMainContext do
   let mvarId ← getMainGoal
   displayLatex (.ofLines (← goalLatexLines mvarId) (some mvarId) (← getOptions)) tk
+
+/-! ## Goal diffs
+
+Like the goal view, the display of `texify` shows how the goal changed in the last tactic.
+Since the info trees of earlier tactics are not available while `texify` runs, the client asks for
+the diff with the RPC method `LatexDisplay.diff`, which runs once the proof has been elaborated:
+it finds `texify` in the info tree and the last tactic before it that changed the goals, and
+takes the changes that the goal view shows (`Lean.Widget.diffInteractiveGoals`). -/
+
+/-- The changes marked in `code`, a goal's hypothesis type or target from
+`Lean.Widget.diffInteractiveGoals`, at positions in the expression that `code` shows. -/
+partial def diffPositions (code : Widget.CodeWithInfos) : Array (SubExpr.Pos × Widget.DiffTag) :=
+  go code #[]
+where
+  go (code : Widget.CodeWithInfos) (acc : Array (SubExpr.Pos × Widget.DiffTag)) :
+      Array (SubExpr.Pos × Widget.DiffTag) :=
+    match code with
+    | .text _ => acc
+    | .append as => as.foldl (fun acc a => go a acc) acc
+    | .tag info a =>
+      go a (if let some d := info.diffStatus? then acc.push (info.subexprPos, d) else acc)
+
+/-- Marks the tags of `code` with `changes`, which are at positions in the expression that `code`
+shows. A change at a position without a tag is shown on its nearest tagged ancestor. -/
+def LatexCode.withDiff (changes : Array (SubExpr.Pos × Widget.DiffTag)) (code : LatexCode) :
+    LatexCode := Id.run do
+  if changes.isEmpty then return code
+  let tagged : Std.HashSet Nat :=
+    code.foldTags (fun s t => if t.binder then s else s.insert t.subexprPos.asNat) {}
+  let mut marks : Std.HashMap Nat Widget.DiffTag := {}
+  for (p, d) in changes do
+    let ps := p.toArray
+    let ancestor? := (List.range (ps.size + 1)).reverse.find? fun k =>
+      tagged.contains (SubExpr.Pos.ofArray (ps.extract 0 k)).asNat
+    if let some k := ancestor? then
+      marks := marks.insert (SubExpr.Pos.ofArray (ps.extract 0 k)).asNat d
+  return code.mapTags fun t =>
+    if t.binder then t else
+      match marks[t.subexprPos.asNat]? with
+      | some d => { t with diff := some d }
+      | none => t
+
+/-- Marks the tags at the root of `code` with `d`, for hypotheses that were added or removed. -/
+def LatexCode.withRootDiff (d : Widget.DiffTag) (code : LatexCode) : LatexCode :=
+  code.mapTags fun t => if !t.binder && t.subexprPos == .root then { t with diff := some d } else t
+
+/-- How the hypotheses of a goal changed: for each changed hypothesis, either the changes in its
+type, or `none` if it was added (or, before the tactic, if it will be removed). -/
+abbrev HypDiffs := Std.HashMap FVarId (Option (Array (SubExpr.Pos × Widget.DiffTag)))
+
+/-- Marks the changes in lines for a goal made by `goalLatexLines`, taking them from the same
+goal decorated by `Lean.Widget.diffInteractiveGoals`. -/
+def diffLines (useAfter : Bool) (ig : Widget.InteractiveGoal) (lines : Array (Array LatexPart)) :
+    Array (Array LatexPart) := Id.run do
+  let mut hyps : HypDiffs := {}
+  for h in ig.hyps do
+    let whole := if useAfter then h.isInserted? == some true else h.isRemoved? == some true
+    let changes := diffPositions h.type
+    for fvarId in h.fvarIds do
+      if whole then hyps := hyps.insert fvarId none
+      else if !changes.isEmpty then hyps := hyps.insert fvarId (some changes)
+  let target := diffPositions ig.type
+  let wholeTag : Widget.DiffTag := if useAfter then .wasInserted else .willDelete
+  return lines.map (·.map fun part =>
+    match part.kind, part.fvarId.bind (hyps[·]?) with
+    | "target", _ => { part with latex := part.latex.withDiff target }
+    | "hypType", some (some δ) => { part with latex := part.latex.withDiff δ }
+    | "hyp", some none | "hypType", some none | "hypValue", some none =>
+      { part with latex := part.latex.withRootDiff wholeTag }
+    | _, _ => part)
+
+/-- The goal before and after the last tactic, with their changes marked. -/
+structure LatexDiff where
+  /-- The goal before the tactic, marking what the tactic changes. -/
+  before : Array (Array LatexPart)
+  /-- The goal after the tactic (the goal shown by `texify`), marking what the tactic changed. -/
+  after : Array (Array LatexPart)
+  /-- The tactic, as written. -/
+  tactic : String
+  deriving Server.RpcEncodable
+
+/-- The diff for the goal `g₁` after the tactic `prev`, if `prev` changed it. The changes are those
+that the goal view shows (`Lean.Widget.diffInteractiveGoals`). -/
+def goalDiff (ci : ContextInfo) (prev : TacticInfo) (g₁ : MVarId) : IO (Option LatexDiff) :=
+  { ci with mctx := prev.mctxAfter }.runMetaM {} do
+    if prev.goalsBefore.contains g₁ || !prev.goalsAfter.contains g₁ then return none
+    let after ← Widget.diffInteractiveGoals true prev { goals := #[← Widget.goalToInteractive g₁] }
+    -- `isInserted? = some false` means that the goal was compared with a goal before the tactic.
+    let some (ig₁ : Widget.InteractiveGoal) := after.goals[0]? | return none
+    unless ig₁.isInserted? == some false do return none
+    let some g₀ ← prev.goalsBefore.findM? fun g₀ => return (← Meta.getMVars (.mvar g₀)).contains g₁
+      | return none
+    let before ← Widget.diffInteractiveGoals false prev { goals := #[← Widget.goalToInteractive g₀] }
+    let some (ig₀ : Widget.InteractiveGoal) := before.goals[0]? | return none
+    return some {
+      before := diffLines false ig₀ (← goalLatexLines g₀)
+      after := diffLines true ig₁ (← goalLatexLines g₁)
+      tactic := (prev.stx.reprint.getD (toString prev.stx.prettyPrint)).trimAscii.toString }
+
+/-- Finds `texify` for the goal `mvarId` in `t`, and the last tactic before it that changed the
+goals, looking at earlier siblings of `texify` and then of its ancestors. -/
+partial def findPrevTactic (mvarId : MVarId) (t : InfoTree) : Option (ContextInfo × TacticInfo) :=
+  (go none t).bind id
+where
+  isTexify : Info → Bool
+    | .ofTacticInfo ti => ti.stx.getKind == ``texifyTac && ti.goalsBefore.contains mvarId
+    | _ => false
+  /-- A tactic that changed the goals. -/
+  changingTactic? (ctx? : Option ContextInfo) : InfoTree → Option (ContextInfo × TacticInfo)
+    | .context i t => changingTactic? (i.mergeIntoOuter? ctx?) t
+    | .node (.ofTacticInfo ti) _ =>
+      if ti.goalsBefore != ti.goalsAfter then ctx?.map (·, ti) else none
+    | _ => none
+  /-- `none` if `texify` is not in the tree, `some none` if it is but no tactic before it was
+  found yet. -/
+  go (ctx? : Option ContextInfo) : InfoTree → Option (Option (ContextInfo × TacticInfo))
+    | .context i t => go (i.mergeIntoOuter? ctx?) t
+    | .hole _ => none
+    | .node i cs =>
+      if isTexify i then some none else
+      let cs := cs.toArray
+      match (List.range cs.size).findSome? fun j => (go ctx? cs[j]!).map (j, ·) with
+      | none => none
+      | some (_, some r) => some (some r)
+      | some (j, none) =>
+        some <| (List.range j).reverse.findSome? fun k => changingTactic? ctx? cs[k]!
+
+/-- Parameters for `LatexDisplay.diff`. -/
+structure LatexDiff.Params where
+  /-- A position in the proof (where the display is shown). -/
+  pos : Lsp.Position
+  /-- The goal shown by `texify`. -/
+  mvarId : MVarId
+  deriving Server.RpcEncodable
+
+/-- The diff for the goal shown by `texify`: the goal before and after the last tactic that
+changed it, with the changes marked. Returns `none` if there is no such tactic. -/
+@[server_rpc_method]
+def LatexDisplay.diff (p : LatexDiff.Params) : Server.RequestM (Server.RequestTask (Option LatexDiff)) :=
+  Server.RequestM.withWaitFindSnapAtPos p.pos fun snap => do
+    let some (ci, prev) := findPrevTactic p.mvarId snap.infoTree | return none
+    goalDiff ci prev p.mvarId

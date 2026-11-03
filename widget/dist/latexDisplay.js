@@ -11,6 +11,60 @@ import {
   useAsync,
   useRpcSession
 } from "@leanprover/infoview";
+function makePref(key, initial) {
+  let value = initial;
+  try {
+    const stored = window.localStorage.getItem(key);
+    if (stored !== null) value = JSON.parse(stored);
+  } catch {
+  }
+  const listeners = /* @__PURE__ */ new Set();
+  const subscribe = (l) => {
+    listeners.add(l);
+    return () => {
+      listeners.delete(l);
+    };
+  };
+  const get = () => value;
+  const set = (v) => {
+    value = v;
+    try {
+      window.localStorage.setItem(key, JSON.stringify(v));
+    } catch {
+    }
+    listeners.forEach((l) => l());
+  };
+  const use = () => [React.useSyncExternalStore(subscribe, get), set];
+  return { get, set, use };
+}
+var popupModePref = makePref("leantex.popupMode", "tex");
+var spotlightPref = makePref("leantex.spotlight", true);
+var legendPref = makePref("leantex.legend", false);
+var diffPref = makePref("leantex.diff", true);
+var beforePref = makePref("leantex.showBefore", false);
+var colorOverridesPref = makePref("leantex.variableColorOverrides", {});
+var crossHover = /* @__PURE__ */ (() => {
+  let value;
+  const listeners = /* @__PURE__ */ new Set();
+  return {
+    subscribe(l) {
+      listeners.add(l);
+      return () => {
+        listeners.delete(l);
+      };
+    },
+    get: () => value,
+    set(v) {
+      if (v?.key === value?.key && v?.owner === value?.owner) return;
+      value = v;
+      listeners.forEach((l) => l());
+    },
+    /** Clears the hover if `owner` set it. */
+    clear(owner) {
+      if (value?.owner === owner) this.set(void 0);
+    }
+  };
+})();
 var DEFAULT_PALETTE = [
   "var(--vscode-charts-blue, #3794ff)",
   "var(--vscode-charts-orange, #d18616)",
@@ -21,33 +75,42 @@ var DEFAULT_PALETTE = [
   "var(--vscode-charts-yellow, #cca700)",
   "var(--vscode-terminal-ansiMagenta, #bc3fbc)"
 ];
-var MAX_COLORS = 64;
-var VarColorsContext = React.createContext({ palette: [], index: /* @__PURE__ */ new Map() });
+var MAX_VARS = 64;
+var VarColorsContext = React.createContext({ palette: [], index: /* @__PURE__ */ new Map(), names: [] });
 function makeVarColors(enabled, custom) {
-  const palette = enabled ? (custom.length > 0 ? custom : DEFAULT_PALETTE).slice(0, MAX_COLORS) : [];
-  return { palette, index: /* @__PURE__ */ new Map() };
+  const palette = enabled ? custom.length > 0 ? custom : DEFAULT_PALETTE : [];
+  return { palette, index: /* @__PURE__ */ new Map(), names: [] };
 }
-function varColorIndex(vc, fvarId) {
+function varNumber(vc, fvarId, name) {
   if (vc.palette.length === 0) return void 0;
   let i = vc.index.get(fvarId);
   if (i === void 0) {
     i = vc.index.size;
     vc.index.set(fvarId, i);
+    vc.names.push(name);
   }
-  return i % vc.palette.length;
+  return i % MAX_VARS;
 }
-function paletteStyle(vc) {
+var varColor = (n) => `var(--lean-var-${n})`;
+function varColorStyle(vc, overrides) {
   const style = {};
-  vc.palette.forEach((c, i) => style[`--lean-var-${i}`] = c);
+  vc.names.forEach((name, i) => {
+    style[`--lean-var-${i % MAX_VARS}`] = overrides[name] ?? vc.palette[i % vc.palette.length];
+  });
   return style;
 }
+var GLYPHS = ":is(use, path, rect, line, text, polygon)";
 var STYLE = `
-.lean-tex {
+.lean-tex, .lean-tex-display {
   --lt-fg: var(--vscode-editor-foreground, currentColor);
   --lt-accent: var(--vscode-focusBorder, #3b82f6);
   --lt-link: var(--vscode-textLink-foreground, var(--lt-accent));
+  --lt-added: var(--vscode-gitDecoration-addedResourceForeground, #81b88b);
+  --lt-removed: var(--vscode-gitDecoration-deletedResourceForeground, #e5534b);
   --lt-hairline: color-mix(in srgb, var(--lt-fg) 12%, transparent);
   --lt-ease: cubic-bezier(.2, .8, .2, 1);
+}
+.lean-tex {
   position: relative;
   /* Keep the z-indices below local, so that tooltips (appended to the body) are painted above. */
   isolation: isolate;
@@ -62,7 +125,7 @@ var STYLE = `
 }
 
 /* Highlights, drawn behind the formula. */
-.lean-tex-box { position: absolute; pointer-events: none; z-index: 0; border-radius: 5px; }
+.lean-tex-box { position: absolute; pointer-events: none; z-index: 0; border-radius: 5px; box-sizing: border-box; }
 .lean-tex-hover {
   --lt-hl: var(--lt-fg);
   background: color-mix(in srgb, var(--lt-hl) 9%, transparent);
@@ -87,24 +150,49 @@ var STYLE = `
   box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--lt-accent) 80%, transparent);
 }
 .lean-tex-underline { background: var(--lt-link); border-radius: 1px; }
-${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lean-var-${i}); color: var(--lean-var-${i}); }`).join("\n")}
+.lean-tex-folded {
+  border: 1px dashed color-mix(in srgb, var(--lt-accent) 60%, transparent);
+  background: color-mix(in srgb, var(--lt-accent) 7%, transparent);
+}
+.lean-fold { fill: var(--lt-accent); color: var(--lt-accent); }
+.lean-tex-diff-added, .lean-tex-diff-removed {
+  border-radius: 4px 4px 2px 2px;
+  animation: lean-tex-fade .3s ease;
+}
+.lean-tex-diff-added {
+  background: color-mix(in srgb, var(--lt-added) 15%, transparent);
+  box-shadow: inset 0 -1.5px 0 color-mix(in srgb, var(--lt-added) 80%, transparent);
+}
+.lean-tex-diff-removed {
+  background: color-mix(in srgb, var(--lt-removed) 14%, transparent);
+  box-shadow: inset 0 -1.5px 0 color-mix(in srgb, var(--lt-removed) 80%, transparent);
+}
+${Array.from({ length: MAX_VARS }, (_, i) => `.lean-var-${i} { fill: var(--lean-var-${i}); color: var(--lean-var-${i}); }`).join("\n")}
+
+/* Spotlight: while hovering, dim the glyphs outside the highlighted subexpressions, which are
+   given by a rule for each formula. Glyph definitions (in <defs>) are left alone. */
+.lean-tex-math svg ${GLYPHS} { transition: opacity .18s ease; }
+.lean-tex-spotlit .lean-tex-math svg ${GLYPHS}:not(defs *) { opacity: .28; }
 
 /* Toolbar */
 .lean-tex-toolbar {
-  position: absolute; top: 0; right: 0; z-index: 2;
-  display: flex; gap: 2px;
+  position: absolute; top: -2px; right: 0; z-index: 3;
+  display: flex; gap: 1px; padding: 2px; border-radius: 7px;
+  background: var(--vscode-editor-background, Canvas);
+  box-shadow: 0 0 0 1px var(--lt-hairline), 0 2px 8px -2px rgba(0, 0, 0, .25);
   opacity: 0; transition: opacity .15s ease;
 }
-.lean-tex-display:hover > .lean-tex > .lean-tex-toolbar,
+.lean-tex-display:hover > .lean-tex-toolbar,
 .lean-tex-toolbar:focus-within { opacity: 1; }
 .lean-tex-icon-button {
   all: unset; box-sizing: border-box; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
   width: 22px; height: 22px; border-radius: 5px;
   color: var(--lt-fg); opacity: .6;
-  transition: opacity .12s ease, background-color .12s ease;
+  transition: opacity .12s ease, background-color .12s ease, color .12s ease;
 }
 .lean-tex-icon-button:hover { opacity: 1; background: color-mix(in srgb, var(--lt-fg) 10%, transparent); }
+.lean-tex-icon-button[aria-pressed="true"] { opacity: 1; color: var(--lt-link); }
 .lean-tex-icon-button:focus-visible { outline: 1px solid var(--lt-accent); }
 
 /* Tooltips */
@@ -152,6 +240,7 @@ ${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lea
 }
 .lean-tex-popup-doc p:first-child { margin-top: 0; }
 .lean-tex-popup-doc p:last-child { margin-bottom: 0; }
+.lean-tex-popup-note { margin-top: 4px; font-size: .85em; opacity: .65; }
 .lean-tex-muted { opacity: .6; }
 .lean-tex-segmented {
   display: inline-flex; padding: 1px; border-radius: 6px;
@@ -169,13 +258,20 @@ ${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lea
   box-shadow: 0 1px 2px rgba(0, 0, 0, .25);
 }
 
-/* Selection list */
-.lean-tex-selection { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--lt-hairline); }
-.lean-tex-selection-head {
-  display: flex; align-items: center; gap: 8px;
+/* Sections below and above the formula */
+.lean-tex-section { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--lt-hairline); }
+.lean-tex-section-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   font-size: 0.85em; letter-spacing: .04em; text-transform: uppercase;
 }
-.lean-tex-selection-head a { text-transform: none; letter-spacing: normal; }
+.lean-tex-section-head a, .lean-tex-section-head code { text-transform: none; letter-spacing: normal; }
+.lean-tex-before {
+  margin-bottom: 8px; padding: 6px 10px 4px; border-radius: 8px;
+  background: color-mix(in srgb, var(--lt-fg) 5%, transparent);
+  box-shadow: inset 0 0 0 1px var(--lt-hairline);
+  animation: lean-tex-fade .2s ease;
+}
+.lean-tex-before > .lean-tex-section-head { margin-bottom: 2px; }
 .lean-tex-selection-item {
   display: flex; align-items: baseline; gap: 10px;
   margin-top: 4px; padding: 2px 8px; border-radius: 6px;
@@ -184,10 +280,26 @@ ${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lea
 }
 .lean-tex-selection-label { flex: none; font-size: 0.85em; opacity: .65; }
 
+/* Legend */
+.lean-tex-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.lean-tex-chip {
+  position: relative; display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 9px 0 7px; border-radius: 999px; cursor: pointer;
+  background: color-mix(in srgb, var(--lt-fg) 6%, transparent);
+  transition: background-color .12s ease;
+}
+.lean-tex-chip:hover { background: color-mix(in srgb, var(--lt-fg) 12%, transparent); }
+.lean-tex-chip p { margin: 0; }
+.lean-tex-swatch { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.lean-tex-chip input {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: 0; cursor: pointer; border: none; padding: 0;
+}
+
 @keyframes lean-tex-fade { from { opacity: 0; } }
 @keyframes lean-tex-pop { from { opacity: 0; transform: translateY(var(--lt-dy, 0)) scale(.985); } }
 @media (prefers-reduced-motion: reduce) {
-  .lean-tex-hover, .lean-tex-occurrence, .lean-tex-tooltip { transition: none; animation: none; }
+  .lean-tex-hover, .lean-tex-occurrence, .lean-tex-tooltip, .lean-tex-math svg * { transition: none; animation: none; }
 }
 `;
 function ensureStyles() {
@@ -200,35 +312,8 @@ function ensureStyles() {
   }
   if (el.textContent !== STYLE) el.textContent = STYLE;
 }
-var MODE_KEY = "leantex.popupMode";
-var popupMode = (() => {
-  try {
-    return window.localStorage.getItem(MODE_KEY) === "lean" ? "lean" : "tex";
-  } catch {
-    return "tex";
-  }
-})();
-var popupModeListeners = /* @__PURE__ */ new Set();
-function usePopupMode() {
-  const [mode, setModeState] = React.useState(popupMode);
-  React.useEffect(() => {
-    popupModeListeners.add(setModeState);
-    return () => {
-      popupModeListeners.delete(setModeState);
-    };
-  }, []);
-  const setMode = React.useCallback((m) => {
-    popupMode = m;
-    try {
-      window.localStorage.setItem(MODE_KEY, m);
-    } catch {
-    }
-    popupModeListeners.forEach((l) => l(m));
-  }, []);
-  return [mode, setMode];
-}
 function partLocation(part, pos, mvarId) {
-  if (mvarId === void 0) return void 0;
+  if (mvarId == null) return void 0;
   let loc;
   switch (part.kind) {
     case "hyp":
@@ -256,46 +341,57 @@ function stripTags(tt) {
   if ("append" in tt) return tt.append.map(stripTags).join("");
   return stripTags(tt.tag[1]);
 }
-function buildLatex(lines, mvarId, vc) {
+function buildLatex(lines, mvarId, vc, folds) {
   const tags = [];
-  const plainLines = [];
   const sources = lines.map((line, li) => {
-    let plainLine = "";
     const tex = line.map((part, pi) => {
       const ids = /* @__PURE__ */ new Map();
       const go = (tt) => {
-        if ("text" in tt) {
-          plainLine += tt.text;
-          return tt.text;
-        }
+        if ("text" in tt) return tt.text;
         if ("append" in tt) return tt.append.map(go).join("");
         const [info, sub] = tt.tag;
         const pos = info.subexprPos ?? "/";
         const idKey = (info.binder ? "b" : "") + pos;
         let id = ids.get(idKey);
+        const first = id === void 0;
         if (id === void 0) {
           id = tags.length;
           ids.set(idKey, id);
           const loc = info.binder ? void 0 : partLocation(part, pos, mvarId);
           const key = loc ? JSON.stringify(loc) : `${li}/${pi}/${idKey}`;
-          const color2 = info.fvarId != null ? varColorIndex(vc, info.fvarId) : void 0;
-          tags.push({ id, info, part, loc, key, color: color2 });
+          const color = info.fvarId != null ? varNumber(vc, info.fvarId, stripTags(sub)) : void 0;
+          const folded = folds.get(key) ?? info.omitted != null;
+          tags.push({ id, info, part, loc, key, color, folded });
         }
-        const color = tags[id].color;
-        const inner = color !== void 0 ? `\\class{lean-var-${color}}{${go(sub)}}` : go(sub);
+        const tag = tags[id];
+        if (tag.folded) return first ? `\\class{lean-se-${id}}{\\class{lean-fold}{\\cdots}}` : "";
+        const inner = tag.color !== void 0 ? `\\class{lean-var-${tag.color}}{${go(sub)}}` : go(sub);
         return `\\class{lean-se-${id}}{${inner}}`;
       };
       return go(part.latex);
     }).join("");
-    plainLines.push(plainLine);
     return `$\\displaystyle ${tex}$`;
   });
   return {
     sources,
     targetLines: lines.map((line, i) => i > 0 && line.some((p) => p.kind === "target")),
-    plain: plainLines.join("\n"),
+    plain: lines.map((line) => line.map((p) => stripTags(p.latex)).join("")).join("\n"),
     tags
   };
+}
+function useFormula(lines, mvarId) {
+  return useFormulaWith(React.useContext(VarColorsContext), lines, mvarId);
+}
+function useFormulaWith(vc, lines, mvarId) {
+  const [folds, setFolds] = React.useState(/* @__PURE__ */ new Map());
+  const built = React.useMemo(
+    () => lines ? buildLatex(lines, mvarId, vc, folds) : void 0,
+    [lines, mvarId, vc, folds]
+  );
+  const toggleFold = React.useCallback((tag) => {
+    setFolds((fs) => new Map(fs).set(tag.key, !tag.folded));
+  }, []);
+  return { built, toggleFold };
 }
 function tagLabel(tag) {
   const { part } = tag;
@@ -327,14 +423,21 @@ function isModifierHeld(e) {
 function tagElements(root, id) {
   return root ? [...root.querySelectorAll(`svg .lean-se-${id}`)] : [];
 }
+function elementRect(el) {
+  const r = el.getBoundingClientRect();
+  if (!el.classList.contains("lean-fold")) return r;
+  const cy = (r.top + r.bottom) / 2;
+  const h = Math.max(r.height, 14);
+  return { left: r.left - 2, right: r.right + 2, top: cy - h / 2 - 1, bottom: cy + h / 2 - 1 };
+}
 function tagIdAt(x, y, root) {
   if (!root) return void 0;
   let best;
   let bestArea = Infinity;
   root.querySelectorAll('svg [class*="lean-se-"]').forEach((el) => {
-    const r = el.getBoundingClientRect();
+    const r = elementRect(el);
     if (x < r.left || x > r.right || y < r.top || y > r.bottom) return;
-    const area = r.width * r.height;
+    const area = (r.right - r.left) * (r.bottom - r.top);
     if (area <= bestArea) {
       const m = /(?:^|\s)lean-se-(\d+)(?:\s|$)/.exec(el.getAttribute("class") ?? "");
       if (m) {
@@ -353,7 +456,7 @@ function tagContains(root, outer, inner) {
 function tagRect(root, id) {
   const els = tagElements(root, id);
   if (els.length === 0) return void 0;
-  const rs = els.map((el) => el.getBoundingClientRect());
+  const rs = els.map(elementRect);
   return {
     left: Math.min(...rs.map((r) => r.left)),
     top: Math.min(...rs.map((r) => r.top)),
@@ -449,12 +552,8 @@ function useLatexPopup(info) {
   const rs = useRpcSession();
   return useAsync(() => rs.call("LeanTeX.LatexDisplay.popup", info), [rs, info]);
 }
-function useBuiltFormula(lines) {
-  const vc = React.useContext(VarColorsContext);
-  return React.useMemo(() => lines ? buildLatex(lines, void 0, vc) : void 0, [lines, vc]);
-}
-function PopupContents({ info, depth }) {
-  const [mode, setMode] = usePopupMode();
+function PopupContents({ info, depth, fold }) {
+  const [mode, setMode] = popupModePref.use();
   const popup = useLatexPopup(info);
   const value = popup.state === "resolved" ? popup.value : void 0;
   const lines = React.useMemo(
@@ -469,10 +568,20 @@ function PopupContents({ info, depth }) {
     ],
     [value]
   );
-  const built = useBuiltFormula(lines);
+  const { built, toggleFold } = useFormula(lines);
   const ec = React.useContext(EditorContext);
   const showLean = mode === "lean" || popup.state === "rejected";
-  return /* @__PURE__ */ React.createElement("div", { className: "tooltip-code-content" }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-head" }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-main" }, showLean ? /* @__PURE__ */ React.createElement(LeanPopupContents, { info, withDoc: popup.state === "rejected" }) : built ? /* @__PURE__ */ React.createElement(InteractiveLatex, { built, depth }) : /* @__PURE__ */ React.createElement("span", { className: "lean-tex-muted" }, "Loading\u2026")), /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-tools" }, value && !showLean && /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { className: "tooltip-code-content" }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-head" }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-main" }, showLean ? /* @__PURE__ */ React.createElement(LeanPopupContents, { info, withDoc: popup.state === "rejected" }) : built ? /* @__PURE__ */ React.createElement(InteractiveLatex, { built, depth, onToggleFold: toggleFold }) : /* @__PURE__ */ React.createElement("span", { className: "lean-tex-muted" }, "Loading\u2026")), /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-tools" }, fold && /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      className: "lean-tex-icon-button codicon " + (fold.folded ? "codicon-unfold" : "codicon-fold"),
+      title: fold.folded ? "Unfold (or click \u22EF)" : "Fold to \u22EF (or Alt-click)",
+      onClick: (e) => {
+        e.stopPropagation();
+        fold.toggle();
+      }
+    }
+  ), value && !showLean && /* @__PURE__ */ React.createElement(
     "button",
     {
       className: "lean-tex-icon-button codicon codicon-copy",
@@ -482,22 +591,39 @@ function PopupContents({ info, depth }) {
         void ec.api.copyToClipboard(stripTags(value.expr));
       }
     }
-  ), /* @__PURE__ */ React.createElement("div", { className: "lean-tex-segmented", role: "group", "aria-label": "Notation" }, /* @__PURE__ */ React.createElement("button", { "aria-pressed": mode === "tex", title: "Show in LaTeX", onClick: () => setMode("tex") }, "TeX"), /* @__PURE__ */ React.createElement("button", { "aria-pressed": mode === "lean", title: "Show in Lean syntax", onClick: () => setMode("lean") }, "Lean")))), value?.doc && /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-doc" }, /* @__PURE__ */ React.createElement(Markdown, { contents: value.doc })));
+  ), /* @__PURE__ */ React.createElement("div", { className: "lean-tex-segmented", role: "group", "aria-label": "Notation" }, /* @__PURE__ */ React.createElement("button", { "aria-pressed": mode === "tex", title: "Show in LaTeX", onClick: () => setMode("tex") }, "TeX"), /* @__PURE__ */ React.createElement("button", { "aria-pressed": mode === "lean", title: "Show in Lean syntax", onClick: () => setMode("lean") }, "Lean")))), fold?.folded && /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-note" }, fold.reason ?? "Folded.", " Click \u22EF to unfold."), value?.doc && /* @__PURE__ */ React.createElement("div", { className: "lean-tex-popup-doc" }, /* @__PURE__ */ React.createElement(Markdown, { contents: value.doc })));
 }
 var MathLine = React.memo(function MathLine2({ source, target }) {
   return /* @__PURE__ */ React.createElement("div", { className: target ? "lean-tex-line lean-tex-target-line" : "lean-tex-line" }, /* @__PURE__ */ React.createElement(Markdown, { contents: source }));
 });
 var SHOW_DELAY = 500;
 var HIDE_DELAY = 300;
+function diffClass(diff) {
+  switch (diff) {
+    case "wasChanged":
+    case "wasInserted":
+      return "lean-tex-diff-added";
+    case "willChange":
+    case "willDelete":
+      return "lean-tex-diff-removed";
+    default:
+      return void 0;
+  }
+}
+var nextFormulaId = 0;
 function InteractiveLatex(props) {
-  const { built, depth, selection, contextMenuId, toolbar } = props;
+  const { built, depth, selection, contextMenuId, onToggleFold, showDiff } = props;
   const { sources, targetLines, tags } = built;
   const ec = React.useContext(EditorContext);
   const rs = useRpcSession();
   const vc = React.useContext(VarColorsContext);
+  const [overrides] = colorOverridesPref.use();
+  const [spotlight] = spotlightPref.use();
+  const cross = React.useSyncExternalStore(crossHover.subscribe, crossHover.get);
   const rootRef = React.useRef(null);
   const mathRef = React.useRef(null);
   const owner = React.useId();
+  const [formulaClass] = React.useState(() => `lean-tex-f${nextFormulaId++}`);
   const selected = selection?.selected ?? [];
   const [hover, setHover] = React.useState();
   const [tips, setTips] = React.useState([]);
@@ -510,6 +636,12 @@ function InteractiveLatex(props) {
     setNoDefTip(void 0);
     goTo.current = /* @__PURE__ */ new Map();
   }, [tags]);
+  const hoveredKey = hover !== void 0 ? tags[hover.id]?.info.key : void 0;
+  React.useEffect(() => {
+    if (hoveredKey !== void 0) crossHover.set({ key: hoveredKey, owner });
+    else crossHover.clear(owner);
+  }, [hoveredKey, owner]);
+  React.useEffect(() => () => crossHover.clear(owner), [owner]);
   const latest = React.useRef({ tags, rs, ec });
   latest.current = { tags, rs, ec };
   const fetchGoTo = React.useCallback(async (id) => {
@@ -607,14 +739,21 @@ function InteractiveLatex(props) {
   const onClick = (e) => {
     const id = tagIdAt(e.clientX, e.clientY, mathRef.current);
     if (id === void 0) return;
+    const tag = tags[id];
     if (e.ctrlKey || e.metaKey) {
       setHover({ id, ctrl: true });
       void execGoTo(id, false);
       return;
     }
     if (e.shiftKey) {
-      selection?.setKeySelected(tags[id].key, (on) => !on);
+      selection?.setKeySelected(tag.key, (on) => !on);
       e.preventDefault();
+      return;
+    }
+    if (onToggleFold && (e.altKey || tag.folded)) {
+      e.preventDefault();
+      setTips([]);
+      onToggleFold(tag);
       return;
     }
     if (isAnyTextSelected()) return;
@@ -668,6 +807,9 @@ function InteractiveLatex(props) {
     });
     return () => h.dispose();
   }, [ec, contextMenuId, execGoTo, setKeySelected]);
+  const hovered = hover !== void 0 ? tags[hover.id] : void 0;
+  const occurrenceKey = hovered ? hovered.info.key : cross && cross.owner !== owner ? cross.key : void 0;
+  const occurrences = occurrenceKey === void 0 ? [] : tags.filter((t) => t.info.key === occurrenceKey && t !== hovered);
   const selectedIds = tags.filter((t) => selected.includes(t.key)).map((t) => t.id);
   const underline = hover !== void 0 && hover.ctrl && !!goTo.current.get(hover.id);
   const [hoverBox, setHoverBox] = React.useState();
@@ -680,25 +822,33 @@ function InteractiveLatex(props) {
     obs.observe(root);
     return () => obs.disconnect();
   }, []);
-  const colorOf = (tag) => tag?.color !== void 0 ? vc.palette[tag.color] : void 0;
-  const highlightKey = JSON.stringify([selectedIds, hover?.id, underline]);
+  const colorOf = (tag) => tag?.color !== void 0 ? varColor(tag.color) : void 0;
+  const highlightKey = JSON.stringify([selectedIds, hover?.id, underline, occurrenceKey, showDiff]);
   React.useLayoutEffect(() => {
     const root = rootRef.current;
     const math = mathRef.current;
     if (!root) return;
     const newBoxes = [];
+    for (const t of tags) {
+      const diff = showDiff ? diffClass(t.info.diff) : void 0;
+      if (diff) {
+        const box = tagBox(root, math, t.id, 1, 0);
+        if (box) newBoxes.push({ key: `diff-${t.id}`, className: diff, box });
+      }
+      if (t.folded) {
+        const box = tagBox(root, math, t.id, 3, 1);
+        if (box) newBoxes.push({ key: `fold-${t.id}`, className: "lean-tex-folded", box });
+      }
+    }
     for (const id of selectedIds) {
       const box = tagBox(root, math, id);
       if (box) newBoxes.push({ key: `sel-${id}`, className: "lean-tex-selected", box });
     }
-    const hovered = hover !== void 0 ? tags[hover.id] : void 0;
+    for (const t of occurrences) {
+      const box = tagBox(root, math, t.id);
+      if (box) newBoxes.push({ key: `occ-${t.id}`, className: "lean-tex-occurrence", box, color: colorOf(hovered ?? t) });
+    }
     if (hovered) {
-      const color = colorOf(hovered);
-      for (const t of tags) {
-        if (t.id === hovered.id || t.info.key !== hovered.info.key) continue;
-        const box2 = tagBox(root, math, t.id);
-        if (box2) newBoxes.push({ key: `occ-${t.id}`, className: "lean-tex-occurrence", box: box2, color });
-      }
       if (underline) {
         const r = tagBox(root, math, hovered.id, 0, 0);
         if (r) {
@@ -710,70 +860,99 @@ function InteractiveLatex(props) {
         }
       }
       const box = tagBox(root, math, hovered.id);
+      const color = colorOf(hovered);
       if (box) setHoverBox((prev) => ({ ...box, color, visible: true, instant: !prev?.visible }));
     } else {
       setHoverBox((prev) => prev && { ...prev, visible: false, instant: false });
     }
     setBoxes(newBoxes);
-  }, [highlightKey, sources, layoutVersion]);
-  return /* @__PURE__ */ React.createElement("div", { ref: rootRef, className: "lean-tex", style: paletteStyle(vc) }, hoverBox && /* @__PURE__ */ React.createElement(
+  }, [highlightKey, sources, tags, layoutVersion]);
+  const spotlit = spotlight && hovered !== void 0;
+  const spotlightRule = spotlit ? `.${formulaClass}.lean-tex-spotlit .lean-tex-math svg :is(${[hovered, ...occurrences].map((t) => `.lean-se-${t.id}`).join(", ")}) ${GLYPHS} { opacity: 1; }` : void 0;
+  const fold = (tag) => onToggleFold && { folded: tag.folded, reason: tag.info.omitted, toggle: () => onToggleFold(tag) };
+  return /* @__PURE__ */ React.createElement(
     "div",
     {
-      className: "lean-tex-box lean-tex-hover" + (hoverBox.color ? " lean-tex-colored" : ""),
-      "data-instant": hoverBox.instant ? "" : void 0,
-      style: {
-        left: hoverBox.left,
-        top: hoverBox.top,
-        width: hoverBox.width,
-        height: hoverBox.height,
-        opacity: hoverBox.visible ? 1 : 0,
-        ...hoverBox.color ? { "--lt-hl": hoverBox.color } : {}
-      }
-    }
-  ), boxes.map((b) => /* @__PURE__ */ React.createElement(
-    "div",
-    {
-      key: b.key,
-      className: "lean-tex-box " + b.className,
-      style: {
-        ...b.box,
-        ...b.color ? { "--lt-hl": b.color } : {}
-      }
-    }
-  )), /* @__PURE__ */ React.createElement(
-    "div",
-    {
-      ref: mathRef,
-      className: "lean-tex-math",
-      style: { cursor: hover !== void 0 ? "pointer" : void 0 },
-      onPointerMove,
-      onPointerLeave,
-      onPointerDown,
-      onMouseDown,
-      onClick,
-      onContextMenu
+      ref: rootRef,
+      className: `lean-tex ${formulaClass}` + (spotlit ? " lean-tex-spotlit" : ""),
+      style: varColorStyle(vc, overrides)
     },
-    sources.map((source, i) => /* @__PURE__ */ React.createElement(MathLine, { key: i, source, target: targetLines[i] }))
-  ), toolbar && /* @__PURE__ */ React.createElement("div", { className: "lean-tex-toolbar" }, toolbar), tips.map(
-    (t) => tags[t.id] && /* @__PURE__ */ React.createElement(
-      Tooltip,
+    spotlightRule && /* @__PURE__ */ React.createElement("style", null, spotlightRule),
+    hoverBox && /* @__PURE__ */ React.createElement(
+      "div",
       {
-        key: t.id,
-        owner,
-        anchor: () => tagRect(mathRef.current, t.id),
-        onPointerEnter: () => {
-          pointerOverTooltip.current = true;
-          window.clearTimeout(hideTimer.current);
-        },
-        onPointerLeave: () => {
-          pointerOverTooltip.current = false;
-          startHideTimeout();
-        },
-        onClick: () => setTips((ts) => ts.map((u) => u.id === t.id ? { ...u, pinned: true } : u))
+        className: "lean-tex-box lean-tex-hover" + (hoverBox.color ? " lean-tex-colored" : ""),
+        "data-instant": hoverBox.instant ? "" : void 0,
+        style: {
+          left: hoverBox.left,
+          top: hoverBox.top,
+          width: hoverBox.width,
+          height: hoverBox.height,
+          opacity: hoverBox.visible ? 1 : 0,
+          ...hoverBox.color ? { "--lt-hl": hoverBox.color } : {}
+        }
+      }
+    ),
+    boxes.map((b) => /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        key: b.key,
+        className: "lean-tex-box " + b.className,
+        style: {
+          ...b.box,
+          ...b.color ? { "--lt-hl": b.color } : {}
+        }
+      }
+    )),
+    /* @__PURE__ */ React.createElement(
+      "div",
+      {
+        ref: mathRef,
+        className: "lean-tex-math",
+        style: { cursor: hover !== void 0 ? "pointer" : void 0 },
+        onPointerMove,
+        onPointerLeave,
+        onPointerDown,
+        onMouseDown,
+        onClick,
+        onContextMenu
       },
-      /* @__PURE__ */ React.createElement(PopupContents, { info: tags[t.id].info.info, depth: depth + 1 })
-    )
-  ), noDefTip !== void 0 && /* @__PURE__ */ React.createElement(Tooltip, { owner, anchor: () => tagRect(mathRef.current, noDefTip), onClick: () => setNoDefTip(void 0) }, "No definition found for this subexpression"));
+      sources.map((source, i) => /* @__PURE__ */ React.createElement(MathLine, { key: i, source, target: targetLines[i] }))
+    ),
+    tips.map(
+      (t) => tags[t.id] && /* @__PURE__ */ React.createElement(
+        Tooltip,
+        {
+          key: t.id,
+          owner,
+          anchor: () => tagRect(mathRef.current, t.id),
+          onPointerEnter: () => {
+            pointerOverTooltip.current = true;
+            window.clearTimeout(hideTimer.current);
+          },
+          onPointerLeave: () => {
+            pointerOverTooltip.current = false;
+            startHideTimeout();
+          },
+          onClick: () => setTips((ts) => ts.map((u) => u.id === t.id ? { ...u, pinned: true } : u))
+        },
+        /* @__PURE__ */ React.createElement(PopupContents, { info: tags[t.id].info.info, depth: depth + 1, fold: fold(tags[t.id]) })
+      )
+    ),
+    noDefTip !== void 0 && /* @__PURE__ */ React.createElement(Tooltip, { owner, anchor: () => tagRect(mathRef.current, noDefTip), onClick: () => setNoDefTip(void 0) }, "No definition found for this subexpression")
+  );
+}
+function IconButton(props) {
+  return /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      className: `lean-tex-icon-button codicon codicon-${props.icon}`,
+      title: props.title,
+      "aria-label": props.title,
+      "aria-pressed": props.pressed,
+      onClick: props.onClick
+    }
+  );
 }
 function CopyButton({ text, title }) {
   const ec = React.useContext(EditorContext);
@@ -784,9 +963,9 @@ function CopyButton({ text, title }) {
     return () => window.clearTimeout(t);
   }, [copied]);
   return /* @__PURE__ */ React.createElement(
-    "button",
+    IconButton,
     {
-      className: "lean-tex-icon-button codicon " + (copied ? "codicon-check" : "codicon-copy"),
+      icon: copied ? "check" : "copy",
       title: copied ? "Copied" : title,
       onClick: () => {
         void ec.api.copyToClipboard(text);
@@ -795,24 +974,97 @@ function CopyButton({ text, title }) {
     }
   );
 }
-function SelectedExpr({ tag }) {
-  const [mode] = usePopupMode();
-  const popup = useLatexPopup(tag.info.info);
-  const value = popup.state === "resolved" ? popup.value : void 0;
-  const lines = React.useMemo(() => value && [[{ latex: value.expr, kind: "expr" }]], [value]);
-  const built = useBuiltFormula(lines);
-  return /* @__PURE__ */ React.createElement("div", { className: "lean-tex-selection-item", "data-location": tag.loc ? JSON.stringify(tag.loc) : void 0 }, /* @__PURE__ */ React.createElement("span", { className: "lean-tex-selection-label font-code", title: tag.loc ? JSON.stringify(tag.loc) : void 0 }, tagLabel(tag)), /* @__PURE__ */ React.createElement("div", { style: { minWidth: 0, flex: 1 } }, mode === "lean" || popup.state === "rejected" ? /* @__PURE__ */ React.createElement(LeanExpr, { info: tag.info.info }) : built ? /* @__PURE__ */ React.createElement(InteractiveLatex, { built, depth: 1 }) : /* @__PURE__ */ React.createElement("span", { className: "lean-tex-muted" }, "\u2026")));
-}
 function LeanExpr({ info }) {
   const rs = useRpcSession();
   const popup = useAsync(() => InteractiveDiagnostics_infoToInteractive(rs, info), [rs, info]);
   return /* @__PURE__ */ React.createElement("span", { className: "font-code pre-wrap" }, popup.state === "resolved" && popup.value.exprExplicit ? /* @__PURE__ */ React.createElement(InteractiveCode, { fmt: popup.value.exprExplicit }) : popup.state === "rejected" ? `Error: ${mapRpcError(popup.error).message}` : "\u2026");
 }
+function SelectedExpr({ tag }) {
+  const [mode] = popupModePref.use();
+  const popup = useLatexPopup(tag.info.info);
+  const value = popup.state === "resolved" ? popup.value : void 0;
+  const lines = React.useMemo(() => value && [[{ latex: value.expr, kind: "expr" }]], [value]);
+  const { built, toggleFold } = useFormula(lines);
+  return /* @__PURE__ */ React.createElement("div", { className: "lean-tex-selection-item", "data-location": tag.loc ? JSON.stringify(tag.loc) : void 0 }, /* @__PURE__ */ React.createElement("span", { className: "lean-tex-selection-label font-code", title: tag.loc ? JSON.stringify(tag.loc) : void 0 }, tagLabel(tag)), /* @__PURE__ */ React.createElement("div", { style: { minWidth: 0, flex: 1 } }, mode === "lean" || popup.state === "rejected" ? /* @__PURE__ */ React.createElement(LeanExpr, { info: tag.info.info }) : built ? /* @__PURE__ */ React.createElement(InteractiveLatex, { built, depth: 1, onToggleFold: toggleFold }) : /* @__PURE__ */ React.createElement("span", { className: "lean-tex-muted" }, "\u2026")));
+}
+function toHex(color) {
+  const m = /rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/.exec(color);
+  if (!m) return "#888888";
+  return "#" + m.slice(1, 4).map((c) => parseInt(c).toString(16).padStart(2, "0")).join("");
+}
+function Legend({ tags }) {
+  const vc = React.useContext(VarColorsContext);
+  const [overrides, setOverrides] = colorOverridesPref.use();
+  const vars = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const t of tags) {
+    if (t.info.fvarId == null || t.color === void 0 || seen.has(t.info.fvarId)) continue;
+    seen.add(t.info.fvarId);
+    vars.push({ name: vc.names[vc.index.get(t.info.fvarId)], key: t.info.key, color: t.color });
+  }
+  const owner = "legend";
+  React.useEffect(() => () => crossHover.clear(owner), []);
+  if (vars.length === 0) return null;
+  const customized = vars.some((v) => overrides[v.name] !== void 0);
+  return /* @__PURE__ */ React.createElement("div", { className: "lean-tex-section", style: varColorStyle(vc, overrides) }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-legend" }, /* @__PURE__ */ React.createElement("span", { className: "lean-tex-section-head lean-tex-muted" }, "Variables"), vars.map((v) => /* @__PURE__ */ React.createElement(
+    "label",
+    {
+      key: v.key,
+      className: "lean-tex-chip",
+      title: `Pick a color for ${v.name}`,
+      onPointerEnter: () => crossHover.set({ key: v.key, owner }),
+      onPointerLeave: () => crossHover.clear(owner)
+    },
+    /* @__PURE__ */ React.createElement("span", { className: "lean-tex-swatch", style: { background: varColor(v.color) } }),
+    /* @__PURE__ */ React.createElement(Markdown, { contents: `$\\class{lean-var-${v.color}}{${v.name}}$` }),
+    /* @__PURE__ */ React.createElement(
+      "input",
+      {
+        type: "color",
+        onPointerDown: (e) => {
+          const swatch = e.currentTarget.parentElement?.querySelector(".lean-tex-swatch");
+          if (swatch) e.currentTarget.value = toHex(getComputedStyle(swatch).backgroundColor);
+        },
+        onChange: (e) => setOverrides({ ...colorOverridesPref.get(), [v.name]: e.target.value })
+      }
+    )
+  )), customized && /* @__PURE__ */ React.createElement(
+    "a",
+    {
+      className: "link pointer lean-tex-muted",
+      onClick: () => {
+        const o = { ...overrides };
+        vars.forEach((v) => delete o[v.name]);
+        setOverrides(o);
+      }
+    },
+    "reset colors"
+  )));
+}
+function useGoalDiff(mvarId, pos, lines) {
+  const rs = useRpcSession();
+  return useAsync(
+    async () => mvarId == null ? null : rs.call("LeanTeX.LatexDisplay.diff", {
+      pos: { line: pos.line, character: pos.character },
+      mvarId
+    }),
+    [rs, mvarId, pos.uri, pos.line, pos.character, lines]
+  );
+}
 function LatexDisplay({ lines, mvarId, pos, colorVariables, variableColors }) {
   const ec = React.useContext(EditorContext);
+  const [showDiff, setShowDiff] = diffPref.use();
+  const [showBefore, setShowBefore] = beforePref.use();
+  const [showLegend, setShowLegend] = legendPref.use();
+  const [spotlight, setSpotlight] = spotlightPref.use();
+  const diffState = useGoalDiff(mvarId, pos, lines);
+  const diff = diffState.state === "resolved" ? diffState.value : null;
+  const shownLines = diff?.after ?? lines;
   const colorsKey = JSON.stringify([colorVariables ?? true, variableColors ?? []]);
-  const vc = React.useMemo(() => makeVarColors(colorVariables ?? true, variableColors ?? []), [colorsKey, lines]);
-  const built = React.useMemo(() => buildLatex(lines, mvarId, vc), [lines, mvarId, vc]);
+  const vc = React.useMemo(() => makeVarColors(colorVariables ?? true, variableColors ?? []), [colorsKey, shownLines]);
+  const main = useFormulaWith(vc, shownLines, mvarId);
+  const built = main.built;
+  const before = useFormulaWith(vc, diff && showBefore ? diff.before : void 0, void 0);
   const { plain, tags } = built;
   const uid = "leantex" + React.useId().replace(/[^a-zA-Z0-9]/g, "");
   React.useLayoutEffect(ensureStyles, []);
@@ -838,13 +1090,49 @@ function LatexDisplay({ lines, mvarId, pos, colorVariables, variableColors }) {
     return () => h.dispose();
   }, [ec, uid]);
   const selectedTags = selected.map((key) => tags.find((t) => t.key === key)).filter((t) => t !== void 0);
+  const hasVars = tags.some((t) => t.color !== void 0);
   return /* @__PURE__ */ React.createElement(VarColorsContext.Provider, { value: vc }, /* @__PURE__ */ React.createElement(
     "div",
     {
       className: "lean-tex-display",
+      style: { position: "relative" },
       "data-vscode-context": JSON.stringify(selected.length > 0 ? { selectedLocationsId: uid } : {}),
       "data-selected-locations": JSON.stringify(selectedTags.flatMap((t) => t.loc ? [t.loc] : []))
     },
+    /* @__PURE__ */ React.createElement("div", { className: "lean-tex-toolbar" }, diff && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement(
+      IconButton,
+      {
+        icon: "history",
+        title: showBefore ? "Hide the goal before the last tactic" : `Show the goal before ${diff.tactic}`,
+        pressed: showBefore,
+        onClick: () => setShowBefore(!showBefore)
+      }
+    ), /* @__PURE__ */ React.createElement(
+      IconButton,
+      {
+        icon: "diff",
+        title: showDiff ? "Hide the changes of the last tactic" : "Highlight the changes of the last tactic",
+        pressed: showDiff,
+        onClick: () => setShowDiff(!showDiff)
+      }
+    )), /* @__PURE__ */ React.createElement(
+      IconButton,
+      {
+        icon: "lightbulb",
+        title: spotlight ? "Turn off spotlight (dimming the rest when hovering)" : "Spotlight: dim the rest when hovering",
+        pressed: spotlight,
+        onClick: () => setSpotlight(!spotlight)
+      }
+    ), hasVars && /* @__PURE__ */ React.createElement(
+      IconButton,
+      {
+        icon: "symbol-color",
+        title: showLegend ? "Hide variable colors" : "Show variable colors",
+        pressed: showLegend,
+        onClick: () => setShowLegend(!showLegend)
+      }
+    ), /* @__PURE__ */ React.createElement(CopyButton, { text: plain, title: "Copy LaTeX" })),
+    diff && showBefore && before.built && /* @__PURE__ */ React.createElement("div", { className: "lean-tex-before" }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-section-head lean-tex-muted" }, /* @__PURE__ */ React.createElement("span", null, "Before"), /* @__PURE__ */ React.createElement("code", { className: "font-code" }, diff.tactic)), /* @__PURE__ */ React.createElement(InteractiveLatex, { built: before.built, depth: 1, onToggleFold: before.toggleFold, showDiff })),
     /* @__PURE__ */ React.createElement(
       InteractiveLatex,
       {
@@ -852,10 +1140,12 @@ function LatexDisplay({ lines, mvarId, pos, colorVariables, variableColors }) {
         depth: 0,
         selection,
         contextMenuId: uid,
-        toolbar: /* @__PURE__ */ React.createElement(CopyButton, { text: plain, title: "Copy LaTeX" })
+        onToggleFold: main.toggleFold,
+        showDiff
       }
     ),
-    selectedTags.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "lean-tex-selection lean-tex" }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-selection-head lean-tex-muted" }, /* @__PURE__ */ React.createElement("span", null, "Selected"), /* @__PURE__ */ React.createElement("span", null, "\xB7"), /* @__PURE__ */ React.createElement("a", { className: "link pointer", onClick: () => setSelected([]) }, "clear"), /* @__PURE__ */ React.createElement("span", { style: { textTransform: "none", letterSpacing: "normal" } }, "(shift-click to toggle)")), selectedTags.map((tag) => /* @__PURE__ */ React.createElement(SelectedExpr, { key: tag.key, tag })))
+    showLegend && /* @__PURE__ */ React.createElement(Legend, { tags }),
+    selectedTags.length > 0 && /* @__PURE__ */ React.createElement("div", { className: "lean-tex-section lean-tex" }, /* @__PURE__ */ React.createElement("div", { className: "lean-tex-section-head lean-tex-muted" }, /* @__PURE__ */ React.createElement("span", null, "Selected"), /* @__PURE__ */ React.createElement("span", null, "\xB7"), /* @__PURE__ */ React.createElement("a", { className: "link pointer", onClick: () => setSelected([]) }, "clear"), /* @__PURE__ */ React.createElement("span", { style: { textTransform: "none", letterSpacing: "normal" } }, "(shift-click to toggle)")), selectedTags.map((tag) => /* @__PURE__ */ React.createElement(SelectedExpr, { key: tag.key, tag })))
   ));
 }
 export {

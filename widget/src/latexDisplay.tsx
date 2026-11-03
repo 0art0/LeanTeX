@@ -10,20 +10,27 @@
  * background, highlights are boxes drawn behind the formula.
  *
  * Variables (free variables that are not proofs, including bound variables, which the server
- * instantiates) are colored: we wrap them in `\class{lean-var-K}{...}` and set `fill` for that class.
- * The colors are assigned in order of first appearance and shared with nested formulas
- * (`VarColorsContext`), so a variable has the same color in the display and in its hovers.
+ * instantiates) are colored: variable number `K` is wrapped in `\class{lean-var-K}{...}`, whose
+ * `fill` is the CSS variable `--lean-var-K`. The numbering is in order of first appearance and is
+ * shared with nested formulas (`VarColorsContext`), so a variable has the same color in the display
+ * and in its hovers. The legend lets the user pick colors, which are remembered by variable name.
  *
  * The interactions follow the infoview's `InteractiveCode` (see `interactiveCode.tsx`,
  * `tooltips.tsx`, `hoverHighlight.tsx` and `goalLocation.tsx` in vscode-lean4):
- * - hovering highlights the innermost subexpression and every other occurrence of it, and shows
+ * - hovering highlights the innermost subexpression and every other occurrence of it, also in other
+ *   formulas on the page (`crossHover`), optionally dims everything else ("spotlight"), and shows
  *   its type and docstring after a delay. The type is rendered in LaTeX by the server
  *   (`LeanTeX.LatexDisplay.popup`) and is itself interactive, so hovers nest;
  * - clicking pins that tooltip, and clicking elsewhere closes it;
  * - Ctrl/⌘-hovering underlines subexpressions that have a definition to go to,
  *   and Ctrl/⌘-clicking goes there;
  * - Shift-clicking (un)selects a subexpression; the selection is cleared when the cursor moves;
+ * - Alt-clicking folds a subexpression to `⋯`, and clicking `⋯` unfolds it. As in the goal view,
+ *   proofs and deep terms start out folded (the server sets `LatexTag.omitted`);
  * - the context menu has "Go to Definition", "Select", "Unselect" and "Unselect All".
+ *
+ * For `texify`, the display also shows how the goal changed in the last tactic, like the goal view
+ * (`LeanTeX.LatexDisplay.diff`), and can show the goal before that tactic.
  *
  * Selection is local to this widget: panel widgets are rendered outside the infoview's
  * `LocationsContext`, so they cannot share the goal view's selection.
@@ -50,13 +57,18 @@ import {
 /** A reference to the server's information about a subexpression. */
 type InfoRef = SubexprInfo['info']
 
-/** Mirrors `LeanTeX.LatexTag`. */
+/** Mirrors `Lean.Widget.DiffTag`. */
+type DiffTag = 'wasChanged' | 'willChange' | 'wasDeleted' | 'willDelete' | 'wasInserted' | 'willInsert'
+
+/** Mirrors `LeanTeX.LatexTag`. (`Option` fields are `null` when absent.) */
 interface LatexTag {
   info: InfoRef
   subexprPos?: string | null
   binder?: boolean
   fvarId?: string | null
   key: string
+  omitted?: string | null
+  diff?: DiffTag | null
 }
 
 /** Mirrors `LeanTeX.LatexCode`. */
@@ -73,7 +85,7 @@ interface LatexPart {
 /** Mirrors `LeanTeX.LatexDisplay.Props`. `pos` is added by ProofWidgets. */
 interface LatexDisplayProps {
   lines: LatexPart[][]
-  mvarId?: string
+  mvarId?: string | null
   colorVariables?: boolean
   variableColors?: string[]
   pos: DocumentPosition
@@ -85,6 +97,92 @@ interface LatexPopup {
   type?: LatexCode | null
   doc?: string | null
 }
+
+/** Mirrors `LeanTeX.LatexDiff`. */
+interface LatexDiff {
+  before: LatexPart[][]
+  after: LatexPart[][]
+  tactic: string
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preferences
+
+/** A preference shared by all displays and remembered across sessions when possible. */
+function makePref<T>(key: string, initial: T) {
+  let value = initial
+  try {
+    const stored = window.localStorage.getItem(key)
+    if (stored !== null) value = JSON.parse(stored) as T
+  } catch {
+    // Storage may be unavailable; the default is used.
+  }
+  const listeners = new Set<() => void>()
+  const subscribe = (l: () => void) => {
+    listeners.add(l)
+    return () => {
+      listeners.delete(l)
+    }
+  }
+  const get = () => value
+  const set = (v: T) => {
+    value = v
+    try {
+      window.localStorage.setItem(key, JSON.stringify(v))
+    } catch {
+      // The preference then lasts for this session.
+    }
+    listeners.forEach(l => l())
+  }
+  const use = (): [T, (v: T) => void] => [React.useSyncExternalStore(subscribe, get), set]
+  return { get, set, use }
+}
+
+/** Whether hovers show the expression and its type in LaTeX or in Lean syntax. */
+const popupModePref = makePref<'tex' | 'lean'>('leantex.popupMode', 'tex')
+/** Whether hovering dims everything but the hovered subexpression and its occurrences. */
+const spotlightPref = makePref('leantex.spotlight', true)
+/** Whether to show the legend of variable colors. */
+const legendPref = makePref('leantex.legend', false)
+/** Whether to highlight what the last tactic changed. */
+const diffPref = makePref('leantex.diff', true)
+/** Whether to show the goal before the last tactic. */
+const beforePref = makePref('leantex.showBefore', false)
+/** Colors that the user picked for variables, by the LaTeX of their names. */
+const colorOverridesPref = makePref<Record<string, string>>('leantex.variableColorOverrides', {})
+
+// ---------------------------------------------------------------------------------------------
+// Cross-formula highlighting
+
+/** The subexpression hovered in some formula, by its key, so that other formulas (the display,
+ * hovers, the goal before the last tactic) can highlight its occurrences too. */
+interface CrossHover {
+  key: string
+  owner: string
+}
+
+const crossHover = (() => {
+  let value: CrossHover | undefined
+  const listeners = new Set<() => void>()
+  return {
+    subscribe(l: () => void) {
+      listeners.add(l)
+      return () => {
+        listeners.delete(l)
+      }
+    },
+    get: () => value,
+    set(v: CrossHover | undefined) {
+      if (v?.key === value?.key && v?.owner === value?.owner) return
+      value = v
+      listeners.forEach(l => l())
+    },
+    /** Clears the hover if `owner` set it. */
+    clear(owner: string) {
+      if (value?.owner === owner) this.set(undefined)
+    },
+  }
+})()
 
 // ---------------------------------------------------------------------------------------------
 // Variable colors
@@ -102,50 +200,65 @@ const DEFAULT_PALETTE = [
   'var(--vscode-terminal-ansiMagenta, #bc3fbc)',
 ]
 
-/** At most this many colors are used, since there is a CSS rule for each. */
-const MAX_COLORS = 64
+/** Variables are numbered modulo this, since there is a CSS rule for each number. */
+const MAX_VARS = 64
 
-/** The colors of variables: `index` maps free variables to indices into `palette`, in order of
- * first appearance (modulo the length of the palette). Nested formulas add their own variables. */
+/** The coloring of variables: `index` numbers the free variables in order of first appearance,
+ * and `names` gives the LaTeX for the name of each. Nested formulas add their own variables. */
 interface VarColors {
   palette: string[]
   index: Map<string, number>
+  names: string[]
 }
 
-const VarColorsContext = React.createContext<VarColors>({ palette: [], index: new Map() })
+const VarColorsContext = React.createContext<VarColors>({ palette: [], index: new Map(), names: [] })
 
 function makeVarColors(enabled: boolean, custom: string[]): VarColors {
-  const palette = enabled ? (custom.length > 0 ? custom : DEFAULT_PALETTE).slice(0, MAX_COLORS) : []
-  return { palette, index: new Map() }
+  const palette = enabled ? (custom.length > 0 ? custom : DEFAULT_PALETTE) : []
+  return { palette, index: new Map(), names: [] }
 }
 
-function varColorIndex(vc: VarColors, fvarId: string): number | undefined {
+/** The number of the variable `fvarId` (modulo `MAX_VARS`), if variables are colored. */
+function varNumber(vc: VarColors, fvarId: string, name: string): number | undefined {
   if (vc.palette.length === 0) return undefined
   let i = vc.index.get(fvarId)
   if (i === undefined) {
     i = vc.index.size
     vc.index.set(fvarId, i)
+    vc.names.push(name)
   }
-  return i % vc.palette.length
+  return i % MAX_VARS
 }
 
-/** CSS variables for the palette, to set on the root of each formula. */
-function paletteStyle(vc: VarColors): React.CSSProperties {
+/** The color of variable number `n`, as CSS. */
+const varColor = (n: number) => `var(--lean-var-${n})`
+
+/** CSS variables for the colors of the variables, to set on the root of each formula. */
+function varColorStyle(vc: VarColors, overrides: Record<string, string>): React.CSSProperties {
   const style: Record<string, string> = {}
-  vc.palette.forEach((c, i) => (style[`--lean-var-${i}`] = c))
+  vc.names.forEach((name, i) => {
+    style[`--lean-var-${i % MAX_VARS}`] = overrides[name] ?? vc.palette[i % vc.palette.length]
+  })
   return style as React.CSSProperties
 }
 
 // ---------------------------------------------------------------------------------------------
 // Styles
 
+/** The leaves that MathJax draws, which spotlight mode dims. */
+const GLYPHS = ':is(use, path, rect, line, text, polygon)'
+
 const STYLE = `
-.lean-tex {
+.lean-tex, .lean-tex-display {
   --lt-fg: var(--vscode-editor-foreground, currentColor);
   --lt-accent: var(--vscode-focusBorder, #3b82f6);
   --lt-link: var(--vscode-textLink-foreground, var(--lt-accent));
+  --lt-added: var(--vscode-gitDecoration-addedResourceForeground, #81b88b);
+  --lt-removed: var(--vscode-gitDecoration-deletedResourceForeground, #e5534b);
   --lt-hairline: color-mix(in srgb, var(--lt-fg) 12%, transparent);
   --lt-ease: cubic-bezier(.2, .8, .2, 1);
+}
+.lean-tex {
   position: relative;
   /* Keep the z-indices below local, so that tooltips (appended to the body) are painted above. */
   isolation: isolate;
@@ -160,7 +273,7 @@ const STYLE = `
 }
 
 /* Highlights, drawn behind the formula. */
-.lean-tex-box { position: absolute; pointer-events: none; z-index: 0; border-radius: 5px; }
+.lean-tex-box { position: absolute; pointer-events: none; z-index: 0; border-radius: 5px; box-sizing: border-box; }
 .lean-tex-hover {
   --lt-hl: var(--lt-fg);
   background: color-mix(in srgb, var(--lt-hl) 9%, transparent);
@@ -185,24 +298,49 @@ const STYLE = `
   box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--lt-accent) 80%, transparent);
 }
 .lean-tex-underline { background: var(--lt-link); border-radius: 1px; }
-${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lean-var-${i}); color: var(--lean-var-${i}); }`).join('\n')}
+.lean-tex-folded {
+  border: 1px dashed color-mix(in srgb, var(--lt-accent) 60%, transparent);
+  background: color-mix(in srgb, var(--lt-accent) 7%, transparent);
+}
+.lean-fold { fill: var(--lt-accent); color: var(--lt-accent); }
+.lean-tex-diff-added, .lean-tex-diff-removed {
+  border-radius: 4px 4px 2px 2px;
+  animation: lean-tex-fade .3s ease;
+}
+.lean-tex-diff-added {
+  background: color-mix(in srgb, var(--lt-added) 15%, transparent);
+  box-shadow: inset 0 -1.5px 0 color-mix(in srgb, var(--lt-added) 80%, transparent);
+}
+.lean-tex-diff-removed {
+  background: color-mix(in srgb, var(--lt-removed) 14%, transparent);
+  box-shadow: inset 0 -1.5px 0 color-mix(in srgb, var(--lt-removed) 80%, transparent);
+}
+${Array.from({ length: MAX_VARS }, (_, i) => `.lean-var-${i} { fill: var(--lean-var-${i}); color: var(--lean-var-${i}); }`).join('\n')}
+
+/* Spotlight: while hovering, dim the glyphs outside the highlighted subexpressions, which are
+   given by a rule for each formula. Glyph definitions (in <defs>) are left alone. */
+.lean-tex-math svg ${GLYPHS} { transition: opacity .18s ease; }
+.lean-tex-spotlit .lean-tex-math svg ${GLYPHS}:not(defs *) { opacity: .28; }
 
 /* Toolbar */
 .lean-tex-toolbar {
-  position: absolute; top: 0; right: 0; z-index: 2;
-  display: flex; gap: 2px;
+  position: absolute; top: -2px; right: 0; z-index: 3;
+  display: flex; gap: 1px; padding: 2px; border-radius: 7px;
+  background: var(--vscode-editor-background, Canvas);
+  box-shadow: 0 0 0 1px var(--lt-hairline), 0 2px 8px -2px rgba(0, 0, 0, .25);
   opacity: 0; transition: opacity .15s ease;
 }
-.lean-tex-display:hover > .lean-tex > .lean-tex-toolbar,
+.lean-tex-display:hover > .lean-tex-toolbar,
 .lean-tex-toolbar:focus-within { opacity: 1; }
 .lean-tex-icon-button {
   all: unset; box-sizing: border-box; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
   width: 22px; height: 22px; border-radius: 5px;
   color: var(--lt-fg); opacity: .6;
-  transition: opacity .12s ease, background-color .12s ease;
+  transition: opacity .12s ease, background-color .12s ease, color .12s ease;
 }
 .lean-tex-icon-button:hover { opacity: 1; background: color-mix(in srgb, var(--lt-fg) 10%, transparent); }
+.lean-tex-icon-button[aria-pressed="true"] { opacity: 1; color: var(--lt-link); }
 .lean-tex-icon-button:focus-visible { outline: 1px solid var(--lt-accent); }
 
 /* Tooltips */
@@ -250,6 +388,7 @@ ${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lea
 }
 .lean-tex-popup-doc p:first-child { margin-top: 0; }
 .lean-tex-popup-doc p:last-child { margin-bottom: 0; }
+.lean-tex-popup-note { margin-top: 4px; font-size: .85em; opacity: .65; }
 .lean-tex-muted { opacity: .6; }
 .lean-tex-segmented {
   display: inline-flex; padding: 1px; border-radius: 6px;
@@ -267,13 +406,20 @@ ${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lea
   box-shadow: 0 1px 2px rgba(0, 0, 0, .25);
 }
 
-/* Selection list */
-.lean-tex-selection { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--lt-hairline); }
-.lean-tex-selection-head {
-  display: flex; align-items: center; gap: 8px;
+/* Sections below and above the formula */
+.lean-tex-section { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--lt-hairline); }
+.lean-tex-section-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   font-size: 0.85em; letter-spacing: .04em; text-transform: uppercase;
 }
-.lean-tex-selection-head a { text-transform: none; letter-spacing: normal; }
+.lean-tex-section-head a, .lean-tex-section-head code { text-transform: none; letter-spacing: normal; }
+.lean-tex-before {
+  margin-bottom: 8px; padding: 6px 10px 4px; border-radius: 8px;
+  background: color-mix(in srgb, var(--lt-fg) 5%, transparent);
+  box-shadow: inset 0 0 0 1px var(--lt-hairline);
+  animation: lean-tex-fade .2s ease;
+}
+.lean-tex-before > .lean-tex-section-head { margin-bottom: 2px; }
 .lean-tex-selection-item {
   display: flex; align-items: baseline; gap: 10px;
   margin-top: 4px; padding: 2px 8px; border-radius: 6px;
@@ -282,10 +428,26 @@ ${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lea
 }
 .lean-tex-selection-label { flex: none; font-size: 0.85em; opacity: .65; }
 
+/* Legend */
+.lean-tex-legend { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.lean-tex-chip {
+  position: relative; display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 9px 0 7px; border-radius: 999px; cursor: pointer;
+  background: color-mix(in srgb, var(--lt-fg) 6%, transparent);
+  transition: background-color .12s ease;
+}
+.lean-tex-chip:hover { background: color-mix(in srgb, var(--lt-fg) 12%, transparent); }
+.lean-tex-chip p { margin: 0; }
+.lean-tex-swatch { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.lean-tex-chip input {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  opacity: 0; cursor: pointer; border: none; padding: 0;
+}
+
 @keyframes lean-tex-fade { from { opacity: 0; } }
 @keyframes lean-tex-pop { from { opacity: 0; transform: translateY(var(--lt-dy, 0)) scale(.985); } }
 @media (prefers-reduced-motion: reduce) {
-  .lean-tex-hover, .lean-tex-occurrence, .lean-tex-tooltip { transition: none; animation: none; }
+  .lean-tex-hover, .lean-tex-occurrence, .lean-tex-tooltip, .lean-tex-math svg * { transition: none; animation: none; }
 }
 `
 
@@ -302,42 +464,6 @@ function ensureStyles() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Preferences
-
-/** Whether hovers show the expression and its type in LaTeX or in Lean syntax. Shared by all
- * hovers and remembered across sessions when possible. */
-type PopupMode = 'tex' | 'lean'
-const MODE_KEY = 'leantex.popupMode'
-let popupMode: PopupMode = (() => {
-  try {
-    return window.localStorage.getItem(MODE_KEY) === 'lean' ? 'lean' : 'tex'
-  } catch {
-    return 'tex'
-  }
-})()
-const popupModeListeners = new Set<(m: PopupMode) => void>()
-
-function usePopupMode(): [PopupMode, (m: PopupMode) => void] {
-  const [mode, setModeState] = React.useState(popupMode)
-  React.useEffect(() => {
-    popupModeListeners.add(setModeState)
-    return () => {
-      popupModeListeners.delete(setModeState)
-    }
-  }, [])
-  const setMode = React.useCallback((m: PopupMode) => {
-    popupMode = m
-    try {
-      window.localStorage.setItem(MODE_KEY, m)
-    } catch {
-      // Storage may be unavailable; the preference then lasts for this session.
-    }
-    popupModeListeners.forEach(l => l(m))
-  }, [])
-  return [mode, setMode]
-}
-
-// ---------------------------------------------------------------------------------------------
 // Building the LaTeX
 
 /** A tagged subexpression. */
@@ -347,11 +473,13 @@ interface Tag {
   part: LatexPart
   /** The goal location, if the subexpression is part of a goal. */
   loc?: GoalsLocation
-  /** Identifies the subexpression for selection. Like the goal view, we identify subexpressions
-   * of goals by their location, so that the selection survives updates of the display. */
+  /** Identifies the subexpression for selection and folding. Like the goal view, we identify
+   * subexpressions of goals by their location, so that this survives updates of the display. */
   key: string
-  /** For variables, the index of the color in the palette. */
+  /** For variables, the variable's number (see `VarColors`). */
   color?: number
+  /** Whether the subexpression is folded to `⋯`. */
+  folded: boolean
 }
 
 /** The LaTeX for a formula, with its tags. */
@@ -360,14 +488,18 @@ interface Built {
   sources: string[]
   /** Whether each line shows the target of a goal. */
   targetLines: boolean[]
-  /** The LaTeX without tags. */
+  /** The LaTeX without tags (and without folding). */
   plain: string
   tags: Tag[]
 }
 
+/** Subexpressions that the user folded (`true`) or unfolded (`false`), by key. Others are folded
+ * if the server says so (`LatexTag.omitted`). */
+type Folds = ReadonlyMap<string, boolean>
+
 /** The location of a subexpression at `pos` in the given part, if the part is in a goal. */
-function partLocation(part: LatexPart, pos: string, mvarId: string | undefined): GoalsLocation | undefined {
-  if (mvarId === undefined) return undefined
+function partLocation(part: LatexPart, pos: string, mvarId: string | null | undefined): GoalsLocation | undefined {
+  if (mvarId == null) return undefined
   let loc: GoalLocation
   switch (part.kind) {
     case 'hyp':
@@ -401,50 +533,66 @@ function stripTags(tt: LatexCode): string {
 /** Builds the MathJax source for each line, assigning ids to tagged subexpressions.
  * Subexpressions are identified by their part and position, since the server may tag
  * several pieces of LaTeX with the same subexpression (for example the base and subscript of
- * `x_i` when a superscript is added). Variables are assigned colors from `vc`. */
-function buildLatex(lines: LatexPart[][], mvarId: string | undefined, vc: VarColors): Built {
+ * `x_i` when a superscript is added). Variables are numbered with `vc`. Folded subexpressions are
+ * shown as `⋯`; their subexpressions get no ids. */
+function buildLatex(lines: LatexPart[][], mvarId: string | null | undefined, vc: VarColors, folds: Folds): Built {
   const tags: Tag[] = []
-  const plainLines: string[] = []
   const sources = lines.map((line, li) => {
-    let plainLine = ''
     const tex = line
       .map((part, pi) => {
         const ids = new Map<string, number>()
         const go = (tt: LatexCode): string => {
-          if ('text' in tt) {
-            plainLine += tt.text
-            return tt.text
-          }
+          if ('text' in tt) return tt.text
           if ('append' in tt) return tt.append.map(go).join('')
           const [info, sub] = tt.tag
           const pos = info.subexprPos ?? '/'
           // A binder's name is tagged with the binder's position, like the binder itself.
           const idKey = (info.binder ? 'b' : '') + pos
           let id = ids.get(idKey)
+          const first = id === undefined
           if (id === undefined) {
             id = tags.length
             ids.set(idKey, id)
             const loc = info.binder ? undefined : partLocation(part, pos, mvarId)
             const key = loc ? JSON.stringify(loc) : `${li}/${pi}/${idKey}`
-            const color = info.fvarId != null ? varColorIndex(vc, info.fvarId) : undefined
-            tags.push({ id, info, part, loc, key, color })
+            const color = info.fvarId != null ? varNumber(vc, info.fvarId, stripTags(sub)) : undefined
+            const folded = folds.get(key) ?? info.omitted != null
+            tags.push({ id, info, part, loc, key, color, folded })
           }
-          const color = tags[id].color
-          const inner = color !== undefined ? `\\class{lean-var-${color}}{${go(sub)}}` : go(sub)
+          const tag = tags[id]
+          if (tag.folded) return first ? `\\class{lean-se-${id}}{\\class{lean-fold}{\\cdots}}` : ''
+          const inner = tag.color !== undefined ? `\\class{lean-var-${tag.color}}{${go(sub)}}` : go(sub)
           return `\\class{lean-se-${id}}{${inner}}`
         }
         return go(part.latex)
       })
       .join('')
-    plainLines.push(plainLine)
     return `$\\displaystyle ${tex}$`
   })
   return {
     sources,
     targetLines: lines.map((line, i) => i > 0 && line.some(p => p.kind === 'target')),
-    plain: plainLines.join('\n'),
+    plain: lines.map(line => line.map(p => stripTags(p.latex)).join('')).join('\n'),
     tags,
   }
+}
+
+/** Fold state of a formula, and the formula built with it, using the variable colors in context. */
+function useFormula(lines: LatexPart[][] | undefined, mvarId?: string | null) {
+  return useFormulaWith(React.useContext(VarColorsContext), lines, mvarId)
+}
+
+/** Like `useFormula`, but with the given variable colors (for use outside their provider). */
+function useFormulaWith(vc: VarColors, lines: LatexPart[][] | undefined, mvarId: string | null | undefined) {
+  const [folds, setFolds] = React.useState<Folds>(new Map())
+  const built = React.useMemo(
+    () => (lines ? buildLatex(lines, mvarId, vc, folds) : undefined),
+    [lines, mvarId, vc, folds],
+  )
+  const toggleFold = React.useCallback((tag: Tag) => {
+    setFolds(fs => new Map(fs).set(tag.key, !tag.folded))
+  }, [])
+  return { built, toggleFold }
 }
 
 /** A short human-readable description of where a subexpression is. */
@@ -488,6 +636,16 @@ function tagElements(root: Element | null, id: number): Element[] {
   return root ? [...root.querySelectorAll(`svg .lean-se-${id}`)] : []
 }
 
+/** The bounding box of an element of a subexpression. The `⋯` of a folded subexpression is only a
+ * couple of pixels high, so we make its box about as high as a line, to make it easy to hit. */
+function elementRect(el: Element): Rect {
+  const r = el.getBoundingClientRect()
+  if (!el.classList.contains('lean-fold')) return r
+  const cy = (r.top + r.bottom) / 2
+  const h = Math.max(r.height, 14)
+  return { left: r.left - 2, right: r.right + 2, top: cy - h / 2 - 1, bottom: cy + h / 2 - 1 }
+}
+
 /** Finds the id of the innermost tagged subexpression at the given point.
  *
  * We use bounding boxes rather than the event target: in SVG only the glyphs themselves receive
@@ -499,9 +657,9 @@ function tagIdAt(x: number, y: number, root: Element | null): number | undefined
   let best: number | undefined
   let bestArea = Infinity
   root.querySelectorAll('svg [class*="lean-se-"]').forEach(el => {
-    const r = el.getBoundingClientRect()
+    const r = elementRect(el)
     if (x < r.left || x > r.right || y < r.top || y > r.bottom) return
-    const area = r.width * r.height
+    const area = (r.right - r.left) * (r.bottom - r.top)
     if (area <= bestArea) {
       const m = /(?:^|\s)lean-se-(\d+)(?:\s|$)/.exec(el.getAttribute('class') ?? '')
       if (m) {
@@ -531,7 +689,7 @@ interface Rect {
 function tagRect(root: Element | null, id: number): Rect | undefined {
   const els = tagElements(root, id)
   if (els.length === 0) return undefined
-  const rs = els.map(el => el.getBoundingClientRect())
+  const rs = els.map(elementRect)
   return {
     left: Math.min(...rs.map(r => r.left)),
     top: Math.min(...rs.map(r => r.top)),
@@ -691,16 +849,17 @@ function useLatexPopup(info: InfoRef) {
   return useAsync<LatexPopup>(() => rs.call<InfoRef, LatexPopup>('LeanTeX.LatexDisplay.popup', info), [rs, info])
 }
 
-/** A formula built from LaTeX code from the server, using the variable colors in context. */
-function useBuiltFormula(lines: LatexPart[][] | undefined): Built | undefined {
-  const vc = React.useContext(VarColorsContext)
-  return React.useMemo(() => (lines ? buildLatex(lines, undefined, vc) : undefined), [lines, vc])
+/** Folding for the subexpression a hover is for. */
+interface PopupFold {
+  folded: boolean
+  reason?: string | null
+  toggle: () => void
 }
 
 /** The hover for a subexpression: the subexpression and its type, rendered in LaTeX and
  * interactive (so that hovers nest), or in Lean syntax; then its docstring. */
-function PopupContents({ info, depth }: { info: InfoRef; depth: number }) {
-  const [mode, setMode] = usePopupMode()
+function PopupContents({ info, depth, fold }: { info: InfoRef; depth: number; fold?: PopupFold }) {
+  const [mode, setMode] = popupModePref.use()
   const popup = useLatexPopup(info)
   const value = popup.state === 'resolved' ? popup.value : undefined
   const lines = React.useMemo<LatexPart[][] | undefined>(
@@ -718,7 +877,7 @@ function PopupContents({ info, depth }: { info: InfoRef; depth: number }) {
       ],
     [value],
   )
-  const built = useBuiltFormula(lines)
+  const { built, toggleFold } = useFormula(lines)
   const ec = React.useContext(EditorContext)
   // If the server cannot render LaTeX (for example an older LeanTeX), show Lean syntax.
   const showLean = mode === 'lean' || popup.state === 'rejected'
@@ -730,12 +889,22 @@ function PopupContents({ info, depth }: { info: InfoRef; depth: number }) {
           {showLean ? (
             <LeanPopupContents info={info} withDoc={popup.state === 'rejected'} />
           ) : built ? (
-            <InteractiveLatex built={built} depth={depth} />
+            <InteractiveLatex built={built} depth={depth} onToggleFold={toggleFold} />
           ) : (
             <span className="lean-tex-muted">Loading…</span>
           )}
         </div>
         <div className="lean-tex-popup-tools">
+          {fold && (
+            <button
+              className={'lean-tex-icon-button codicon ' + (fold.folded ? 'codicon-unfold' : 'codicon-fold')}
+              title={fold.folded ? 'Unfold (or click ⋯)' : 'Fold to ⋯ (or Alt-click)'}
+              onClick={e => {
+                e.stopPropagation()
+                fold.toggle()
+              }}
+            />
+          )}
           {value && !showLean && (
             <button
               className="lean-tex-icon-button codicon codicon-copy"
@@ -756,6 +925,11 @@ function PopupContents({ info, depth }: { info: InfoRef; depth: number }) {
           </div>
         </div>
       </div>
+      {fold?.folded && (
+        <div className="lean-tex-popup-note">
+          {fold.reason ?? 'Folded.'} Click ⋯ to unfold.
+        </div>
+      )}
       {value?.doc && (
         <div className="lean-tex-popup-doc">
           <Markdown contents={value.doc} />
@@ -799,6 +973,22 @@ interface HoverBox extends Box {
   instant: boolean
 }
 
+/** The class for the highlight of a change, if `diff` is one to show. */
+function diffClass(diff: DiffTag | null | undefined): string | undefined {
+  switch (diff) {
+    case 'wasChanged':
+    case 'wasInserted':
+      return 'lean-tex-diff-added'
+    case 'willChange':
+    case 'willDelete':
+      return 'lean-tex-diff-removed'
+    default:
+      return undefined
+  }
+}
+
+let nextFormulaId = 0
+
 /** A formula with interactive subexpressions. Used for the display itself and, recursively,
  * for the hovers of its subexpressions (`depth > 0`), which have no selection or context menu. */
 function InteractiveLatex(props: {
@@ -807,16 +997,22 @@ function InteractiveLatex(props: {
   selection?: Selection
   /** Prefix for context menu ids; enables the context menu. */
   contextMenuId?: string
-  toolbar?: React.ReactNode
+  onToggleFold?: (tag: Tag) => void
+  /** Whether to highlight changes in the last tactic (`LatexTag.diff`). */
+  showDiff?: boolean
 }) {
-  const { built, depth, selection, contextMenuId, toolbar } = props
+  const { built, depth, selection, contextMenuId, onToggleFold, showDiff } = props
   const { sources, targetLines, tags } = built
   const ec = React.useContext(EditorContext)
   const rs = useRpcSession()
   const vc = React.useContext(VarColorsContext)
+  const [overrides] = colorOverridesPref.use()
+  const [spotlight] = spotlightPref.use()
+  const cross = React.useSyncExternalStore(crossHover.subscribe, crossHover.get)
   const rootRef = React.useRef<HTMLDivElement>(null)
   const mathRef = React.useRef<HTMLDivElement>(null)
   const owner = React.useId()
+  const [formulaClass] = React.useState(() => `lean-tex-f${nextFormulaId++}`)
   const selected = selection?.selected ?? []
 
   // The hovered subexpression, and whether Ctrl/⌘ is held.
@@ -836,6 +1032,14 @@ function InteractiveLatex(props: {
     setNoDefTip(undefined)
     goTo.current = new Map()
   }, [tags])
+
+  // Let other formulas highlight the occurrences of the hovered subexpression.
+  const hoveredKey = hover !== undefined ? tags[hover.id]?.info.key : undefined
+  React.useEffect(() => {
+    if (hoveredKey !== undefined) crossHover.set({ key: hoveredKey, owner })
+    else crossHover.clear(owner)
+  }, [hoveredKey, owner])
+  React.useEffect(() => () => crossHover.clear(owner), [owner])
 
   // Latest values, for callbacks registered with event emitters and timers.
   const latest = React.useRef({ tags, rs, ec })
@@ -946,14 +1150,22 @@ function InteractiveLatex(props: {
   const onClick = (e: React.MouseEvent) => {
     const id = tagIdAt(e.clientX, e.clientY, mathRef.current)
     if (id === undefined) return
+    const tag = tags[id]
     if (e.ctrlKey || e.metaKey) {
       setHover({ id, ctrl: true })
       void execGoTo(id, false)
       return
     }
     if (e.shiftKey) {
-      selection?.setKeySelected(tags[id].key, on => !on)
+      selection?.setKeySelected(tag.key, on => !on)
       e.preventDefault()
+      return
+    }
+    // Alt-clicking folds, and clicking `⋯` unfolds.
+    if (onToggleFold && (e.altKey || tag.folded)) {
+      e.preventDefault()
+      setTips([])
+      onToggleFold(tag)
       return
     }
     if (isAnyTextSelected()) return
@@ -1016,6 +1228,11 @@ function InteractiveLatex(props: {
   }, [ec, contextMenuId, execGoTo, setKeySelected])
 
   // Highlights, recomputed when the highlighted subexpressions or the layout change.
+  const hovered = hover !== undefined ? tags[hover.id] : undefined
+  // The subexpressions to highlight as occurrences: of the subexpression hovered here, or else of
+  // the one hovered in another formula.
+  const occurrenceKey = hovered ? hovered.info.key : cross && cross.owner !== owner ? cross.key : undefined
+  const occurrences = occurrenceKey === undefined ? [] : tags.filter(t => t.info.key === occurrenceKey && t !== hovered)
   const selectedIds = tags.filter(t => selected.includes(t.key)).map(t => t.id)
   const underline = hover !== undefined && hover.ctrl && !!goTo.current.get(hover.id)
   const [hoverBox, setHoverBox] = React.useState<HoverBox>()
@@ -1028,26 +1245,33 @@ function InteractiveLatex(props: {
     obs.observe(root)
     return () => obs.disconnect()
   }, [])
-  const colorOf = (tag: Tag | undefined) => (tag?.color !== undefined ? vc.palette[tag.color] : undefined)
-  const highlightKey = JSON.stringify([selectedIds, hover?.id, underline])
+  const colorOf = (tag: Tag | undefined) => (tag?.color !== undefined ? varColor(tag.color) : undefined)
+  const highlightKey = JSON.stringify([selectedIds, hover?.id, underline, occurrenceKey, showDiff])
   React.useLayoutEffect(() => {
     const root = rootRef.current
     const math = mathRef.current
     if (!root) return
     const newBoxes: typeof boxes = []
+    for (const t of tags) {
+      const diff = showDiff ? diffClass(t.info.diff) : undefined
+      if (diff) {
+        const box = tagBox(root, math, t.id, 1, 0)
+        if (box) newBoxes.push({ key: `diff-${t.id}`, className: diff, box })
+      }
+      if (t.folded) {
+        const box = tagBox(root, math, t.id, 3, 1)
+        if (box) newBoxes.push({ key: `fold-${t.id}`, className: 'lean-tex-folded', box })
+      }
+    }
     for (const id of selectedIds) {
       const box = tagBox(root, math, id)
       if (box) newBoxes.push({ key: `sel-${id}`, className: 'lean-tex-selected', box })
     }
-    const hovered = hover !== undefined ? tags[hover.id] : undefined
+    for (const t of occurrences) {
+      const box = tagBox(root, math, t.id)
+      if (box) newBoxes.push({ key: `occ-${t.id}`, className: 'lean-tex-occurrence', box, color: colorOf(hovered ?? t) })
+    }
     if (hovered) {
-      // The other occurrences of the hovered subexpression.
-      const color = colorOf(hovered)
-      for (const t of tags) {
-        if (t.id === hovered.id || t.info.key !== hovered.info.key) continue
-        const box = tagBox(root, math, t.id)
-        if (box) newBoxes.push({ key: `occ-${t.id}`, className: 'lean-tex-occurrence', box, color })
-      }
       if (underline) {
         const r = tagBox(root, math, hovered.id, 0, 0)
         if (r) {
@@ -1059,15 +1283,32 @@ function InteractiveLatex(props: {
         }
       }
       const box = tagBox(root, math, hovered.id)
+      const color = colorOf(hovered)
       if (box) setHoverBox(prev => ({ ...box, color, visible: true, instant: !prev?.visible }))
     } else {
       setHoverBox(prev => prev && { ...prev, visible: false, instant: false })
     }
     setBoxes(newBoxes)
-  }, [highlightKey, sources, layoutVersion])
+  }, [highlightKey, sources, tags, layoutVersion])
+
+  // Spotlight: while hovering, dim everything but the hovered subexpression and its occurrences.
+  const spotlit = spotlight && hovered !== undefined
+  const spotlightRule = spotlit
+    ? `.${formulaClass}.lean-tex-spotlit .lean-tex-math svg :is(${[hovered, ...occurrences]
+        .map(t => `.lean-se-${t.id}`)
+        .join(', ')}) ${GLYPHS} { opacity: 1; }`
+    : undefined
+
+  const fold = (tag: Tag): PopupFold | undefined =>
+    onToggleFold && { folded: tag.folded, reason: tag.info.omitted, toggle: () => onToggleFold(tag) }
 
   return (
-    <div ref={rootRef} className="lean-tex" style={paletteStyle(vc)}>
+    <div
+      ref={rootRef}
+      className={`lean-tex ${formulaClass}` + (spotlit ? ' lean-tex-spotlit' : '')}
+      style={varColorStyle(vc, overrides)}
+    >
+      {spotlightRule && <style>{spotlightRule}</style>}
       {hoverBox && (
         <div
           className={'lean-tex-box lean-tex-hover' + (hoverBox.color ? ' lean-tex-colored' : '')}
@@ -1107,7 +1348,6 @@ function InteractiveLatex(props: {
           <MathLine key={i} source={source} target={targetLines[i]} />
         ))}
       </div>
-      {toolbar && <div className="lean-tex-toolbar">{toolbar}</div>}
       {tips.map(
         t =>
           tags[t.id] && (
@@ -1126,7 +1366,7 @@ function InteractiveLatex(props: {
               // Interacting with a tooltip (e.g. pinning a tooltip inside it) pins it.
               onClick={() => setTips(ts => ts.map(u => (u.id === t.id ? { ...u, pinned: true } : u)))}
             >
-              <PopupContents info={tags[t.id].info.info} depth={depth + 1} />
+              <PopupContents info={tags[t.id].info.info} depth={depth + 1} fold={fold(tags[t.id])} />
             </Tooltip>
           ),
       )}
@@ -1142,6 +1382,18 @@ function InteractiveLatex(props: {
 // ---------------------------------------------------------------------------------------------
 // The display
 
+function IconButton(props: { icon: string; title: string; pressed?: boolean; onClick: () => void }) {
+  return (
+    <button
+      className={`lean-tex-icon-button codicon codicon-${props.icon}`}
+      title={props.title}
+      aria-label={props.title}
+      aria-pressed={props.pressed}
+      onClick={props.onClick}
+    />
+  )
+}
+
 /** A button that copies `text`, confirming with a check mark. */
 function CopyButton({ text, title }: { text: string; title: string }) {
   const ec = React.useContext(EditorContext)
@@ -1152,39 +1404,14 @@ function CopyButton({ text, title }: { text: string; title: string }) {
     return () => window.clearTimeout(t)
   }, [copied])
   return (
-    <button
-      className={'lean-tex-icon-button codicon ' + (copied ? 'codicon-check' : 'codicon-copy')}
+    <IconButton
+      icon={copied ? 'check' : 'copy'}
       title={copied ? 'Copied' : title}
       onClick={() => {
         void ec.api.copyToClipboard(text)
         setCopied(true)
       }}
     />
-  )
-}
-
-/** A selected subexpression, in LaTeX (or Lean syntax, following the hover preference). */
-function SelectedExpr({ tag }: { tag: Tag }) {
-  const [mode] = usePopupMode()
-  const popup = useLatexPopup(tag.info.info)
-  const value = popup.state === 'resolved' ? popup.value : undefined
-  const lines = React.useMemo<LatexPart[][] | undefined>(() => value && [[{ latex: value.expr, kind: 'expr' }]], [value])
-  const built = useBuiltFormula(lines)
-  return (
-    <div className="lean-tex-selection-item" data-location={tag.loc ? JSON.stringify(tag.loc) : undefined}>
-      <span className="lean-tex-selection-label font-code" title={tag.loc ? JSON.stringify(tag.loc) : undefined}>
-        {tagLabel(tag)}
-      </span>
-      <div style={{ minWidth: 0, flex: 1 }}>
-        {mode === 'lean' || popup.state === 'rejected' ? (
-          <LeanExpr info={tag.info.info} />
-        ) : built ? (
-          <InteractiveLatex built={built} depth={1} />
-        ) : (
-          <span className="lean-tex-muted">…</span>
-        )}
-      </div>
-    </div>
   )
 }
 
@@ -1205,12 +1432,130 @@ function LeanExpr({ info }: { info: InfoRef }) {
   )
 }
 
+/** A selected subexpression, in LaTeX (or Lean syntax, following the hover preference). */
+function SelectedExpr({ tag }: { tag: Tag }) {
+  const [mode] = popupModePref.use()
+  const popup = useLatexPopup(tag.info.info)
+  const value = popup.state === 'resolved' ? popup.value : undefined
+  const lines = React.useMemo<LatexPart[][] | undefined>(() => value && [[{ latex: value.expr, kind: 'expr' }]], [value])
+  const { built, toggleFold } = useFormula(lines)
+  return (
+    <div className="lean-tex-selection-item" data-location={tag.loc ? JSON.stringify(tag.loc) : undefined}>
+      <span className="lean-tex-selection-label font-code" title={tag.loc ? JSON.stringify(tag.loc) : undefined}>
+        {tagLabel(tag)}
+      </span>
+      <div style={{ minWidth: 0, flex: 1 }}>
+        {mode === 'lean' || popup.state === 'rejected' ? (
+          <LeanExpr info={tag.info.info} />
+        ) : built ? (
+          <InteractiveLatex built={built} depth={1} onToggleFold={toggleFold} />
+        ) : (
+          <span className="lean-tex-muted">…</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Converts a computed CSS color (`rgb(r, g, b)`) to `#rrggbb`, for color inputs. */
+function toHex(color: string): string {
+  const m = /rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/.exec(color)
+  if (!m) return '#888888'
+  return '#' + m.slice(1, 4).map(c => parseInt(c).toString(16).padStart(2, '0')).join('')
+}
+
+/** The variables of a formula with their colors. Hovering a variable highlights it everywhere, and
+ * clicking it picks its color, which is remembered by the variable's name. */
+function Legend({ tags }: { tags: Tag[] }) {
+  const vc = React.useContext(VarColorsContext)
+  const [overrides, setOverrides] = colorOverridesPref.use()
+  const vars: { name: string; key: string; color: number }[] = []
+  const seen = new Set<string>()
+  for (const t of tags) {
+    if (t.info.fvarId == null || t.color === undefined || seen.has(t.info.fvarId)) continue
+    seen.add(t.info.fvarId)
+    vars.push({ name: vc.names[vc.index.get(t.info.fvarId)!], key: t.info.key, color: t.color })
+  }
+  const owner = 'legend'
+  React.useEffect(() => () => crossHover.clear(owner), [])
+  if (vars.length === 0) return null
+  const customized = vars.some(v => overrides[v.name] !== undefined)
+  return (
+    <div className="lean-tex-section" style={varColorStyle(vc, overrides)}>
+      <div className="lean-tex-legend">
+        <span className="lean-tex-section-head lean-tex-muted">Variables</span>
+        {vars.map(v => (
+          <label
+            key={v.key}
+            className="lean-tex-chip"
+            title={`Pick a color for ${v.name}`}
+            onPointerEnter={() => crossHover.set({ key: v.key, owner })}
+            onPointerLeave={() => crossHover.clear(owner)}
+          >
+            <span className="lean-tex-swatch" style={{ background: varColor(v.color) }} />
+            <Markdown contents={`$\\class{lean-var-${v.color}}{${v.name}}$`} />
+            <input
+              type="color"
+              onPointerDown={e => {
+                const swatch = e.currentTarget.parentElement?.querySelector('.lean-tex-swatch')
+                if (swatch) e.currentTarget.value = toHex(getComputedStyle(swatch).backgroundColor)
+              }}
+              onChange={e => setOverrides({ ...colorOverridesPref.get(), [v.name]: e.target.value })}
+            />
+          </label>
+        ))}
+        {customized && (
+          <a
+            className="link pointer lean-tex-muted"
+            onClick={() => {
+              const o = { ...overrides }
+              vars.forEach(v => delete o[v.name])
+              setOverrides(o)
+            }}
+          >
+            reset colors
+          </a>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Fetches the diff for the goal shown by `texify` (see `LeanTeX.LatexDisplay.diff`). */
+function useGoalDiff(mvarId: string | null | undefined, pos: DocumentPosition, lines: LatexPart[][]) {
+  const rs = useRpcSession()
+  return useAsync<LatexDiff | null>(
+    async () =>
+      mvarId == null
+        ? null
+        : rs.call<unknown, LatexDiff | null>('LeanTeX.LatexDisplay.diff', {
+            pos: { line: pos.line, character: pos.character },
+            mvarId,
+          }),
+    [rs, mvarId, pos.uri, pos.line, pos.character, lines],
+  )
+}
+
 export default function LatexDisplay({ lines, mvarId, pos, colorVariables, variableColors }: LatexDisplayProps) {
   const ec = React.useContext(EditorContext)
+  const [showDiff, setShowDiff] = diffPref.use()
+  const [showBefore, setShowBefore] = beforePref.use()
+  const [showLegend, setShowLegend] = legendPref.use()
+  const [spotlight, setSpotlight] = spotlightPref.use()
+
+  // The goal with the changes of the last tactic marked, once the server has computed them. It is
+  // the same goal as `lines`, so we always use it when it is available.
+  const diffState = useGoalDiff(mvarId, pos, lines)
+  const diff = diffState.state === 'resolved' ? diffState.value : null
+  const shownLines = diff?.after ?? lines
+
   const colorsKey = JSON.stringify([colorVariables ?? true, variableColors ?? []])
-  // New colors for new contents, so that variables are colored in order of appearance.
-  const vc = React.useMemo(() => makeVarColors(colorVariables ?? true, variableColors ?? []), [colorsKey, lines])
-  const built = React.useMemo(() => buildLatex(lines, mvarId, vc), [lines, mvarId, vc])
+  // New numbering for new contents, so that variables are colored in order of appearance.
+  const vc = React.useMemo(() => makeVarColors(colorVariables ?? true, variableColors ?? []), [colorsKey, shownLines])
+  const main = useFormulaWith(vc, shownLines, mvarId)
+  const built = main.built!
+  // Built after the main formula, so that variables are numbered in their order there.
+  const before = useFormulaWith(vc, diff && showBefore ? diff.before : undefined, undefined)
   const { plain, tags } = built
   // Prefix for the ids used in context menu actions.
   const uid = 'leantex' + React.useId().replace(/[^a-zA-Z0-9]/g, '')
@@ -1245,24 +1590,70 @@ export default function LatexDisplay({ lines, mvarId, pos, colorVariables, varia
   const selectedTags = selected
     .map(key => tags.find(t => t.key === key))
     .filter((t): t is Tag => t !== undefined)
+  const hasVars = tags.some(t => t.color !== undefined)
 
   return (
     <VarColorsContext.Provider value={vc}>
       <div
         className="lean-tex-display"
+        style={{ position: 'relative' }}
         data-vscode-context={JSON.stringify(selected.length > 0 ? { selectedLocationsId: uid } : {})}
         data-selected-locations={JSON.stringify(selectedTags.flatMap(t => (t.loc ? [t.loc] : [])))}
       >
+        <div className="lean-tex-toolbar">
+          {diff && (
+            <>
+              <IconButton
+                icon="history"
+                title={showBefore ? 'Hide the goal before the last tactic' : `Show the goal before ${diff.tactic}`}
+                pressed={showBefore}
+                onClick={() => setShowBefore(!showBefore)}
+              />
+              <IconButton
+                icon="diff"
+                title={showDiff ? 'Hide the changes of the last tactic' : 'Highlight the changes of the last tactic'}
+                pressed={showDiff}
+                onClick={() => setShowDiff(!showDiff)}
+              />
+            </>
+          )}
+          <IconButton
+            icon="lightbulb"
+            title={spotlight ? 'Turn off spotlight (dimming the rest when hovering)' : 'Spotlight: dim the rest when hovering'}
+            pressed={spotlight}
+            onClick={() => setSpotlight(!spotlight)}
+          />
+          {hasVars && (
+            <IconButton
+              icon="symbol-color"
+              title={showLegend ? 'Hide variable colors' : 'Show variable colors'}
+              pressed={showLegend}
+              onClick={() => setShowLegend(!showLegend)}
+            />
+          )}
+          <CopyButton text={plain} title="Copy LaTeX" />
+        </div>
+        {diff && showBefore && before.built && (
+          <div className="lean-tex-before">
+            <div className="lean-tex-section-head lean-tex-muted">
+              <span>Before</span>
+              <code className="font-code">{diff.tactic}</code>
+            </div>
+            <InteractiveLatex built={before.built} depth={1} onToggleFold={before.toggleFold} showDiff={showDiff} />
+          </div>
+        )}
         <InteractiveLatex
           built={built}
           depth={0}
           selection={selection}
           contextMenuId={uid}
-          toolbar={<CopyButton text={plain} title="Copy LaTeX" />}
+          onToggleFold={main.toggleFold}
+          showDiff={showDiff}
         />
+        {showLegend && <Legend tags={tags} />}
         {selectedTags.length > 0 && (
-          <div className="lean-tex-selection lean-tex">
-            <div className="lean-tex-selection-head lean-tex-muted">
+          <div className="lean-tex-section lean-tex">
+            <div className="lean-tex-section-head lean-tex-muted">
               <span>Selected</span>
               <span>·</span>
               <a className="link pointer" onClick={() => setSelected([])}>
