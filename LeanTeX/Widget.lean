@@ -71,12 +71,16 @@ structure LatexPart where
   * `"text"`: nothing (for example a separator).
   * `"expr"`: an expression that is not part of a goal.
   * `"hyp"`, `"hypType"`, `"hypValue"`: the name, type or value of the hypothesis `fvarId`.
-  * `"target"`: the target of the goal. -/
+  * `"target"`: the target of the goal.
+  * `"turnstile"`: the `⊢` before the target. -/
   kind : String := "text"
   /-- For hypothesis parts, the hypothesis. -/
   fvarId : Option FVarId := none
   /-- For hypothesis parts, the name of the hypothesis, for display purposes. -/
   name : Option String := none
+  /-- For hypothesis parts, whether the hypothesis is inaccessible (such as `x✝`), which the goal
+  view shows dimmed. -/
+  inaccessible : Bool := false
   deriving Server.RpcEncodable
 
 /-- Props for `LatexDisplay`. -/
@@ -301,7 +305,8 @@ def goalLatexLines (mvarId : MVarId) : MetaM (Array (Array LatexPart)) := mvarId
   for decl in (← getLCtx) do
     unless decl.isImplementationDetail do
       let hyp (kind : String) (latex : LatexCode) : LatexPart :=
-        { latex, kind, fvarId := decl.fvarId, name := decl.userName.toString }
+        { latex, kind, fvarId := decl.fvarId, name := decl.userName.toString
+          inaccessible := decl.userName.hasMacroScopes || decl.userName.isInaccessibleUserName }
       let var := hyp "hyp" (← latexWithInfos decl.toExpr)
       let typeLatex ← latexWithInfos (← instantiateMVars decl.type)
       if let some value := decl.value? then
@@ -318,7 +323,7 @@ def goalLatexLines (mvarId : MVarId) : MetaM (Array (Array LatexPart)) := mvarId
         currCDecl? := some (#[var], type, hyp "hypType" typeLatex)
   (lines, _) := flush lines currCDecl?
   let goal ← latexWithInfos (← instantiateMVars (← mvarId.getType)).consumeMData
-  return lines.push #[text "\\vdash ", { latex := goal, kind := "target" }]
+  return lines.push #[{ latex := .text "\\vdash ", kind := "turnstile" }, { latex := goal, kind := "target" }]
 
 /--
 Tactic for displaying the goal in LaTeX form.

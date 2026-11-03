@@ -67,12 +67,10 @@ var crossHover = /* @__PURE__ */ (() => {
 })();
 var DEFAULT_PALETTE = [
   "var(--vscode-charts-blue, #3794ff)",
-  "var(--vscode-charts-orange, #d18616)",
   "var(--vscode-charts-purple, #b180d7)",
   "var(--vscode-charts-green, #4fb36b)",
   "var(--vscode-charts-red, #f14c4c)",
   "var(--vscode-terminal-ansiCyan, #11a8cd)",
-  "var(--vscode-charts-yellow, #cca700)",
   "var(--vscode-terminal-ansiMagenta, #bc3fbc)"
 ];
 var MAX_VARS = 64;
@@ -108,6 +106,10 @@ var STYLE = `
   --lt-added: var(--vscode-gitDecoration-addedResourceForeground, #81b88b);
   --lt-removed: var(--vscode-gitDecoration-deletedResourceForeground, #e5534b);
   --lt-hairline: color-mix(in srgb, var(--lt-fg) 12%, transparent);
+  /* The goal view's colors (\`goal-hyp\`, \`goal-vdash\` and \`goal-inaccessible\` in the infoview). */
+  --lt-hyp: var(--vscode-lean4-infoView\\.hypothesisName, var(--vscode-charts-orange, #d18616));
+  --lt-hyp-inaccessible: var(--vscode-lean4-infoView\\.inaccessibleHypothesisName, var(--lt-hyp));
+  --lt-vdash: var(--vscode-lean4-infoView\\.turnstile, var(--vscode-charts-blue, #3794ff));
   --lt-ease: cubic-bezier(.2, .8, .2, 1);
 }
 .lean-tex {
@@ -155,6 +157,9 @@ var STYLE = `
   background: color-mix(in srgb, var(--lt-accent) 7%, transparent);
 }
 .lean-fold { fill: var(--lt-accent); color: var(--lt-accent); }
+.lean-hyp { fill: var(--lt-hyp); color: var(--lt-hyp); }
+.lean-hyp-inaccessible { fill: var(--lt-hyp-inaccessible); color: var(--lt-hyp-inaccessible); opacity: .7; }
+.lean-vdash { fill: var(--lt-vdash); color: var(--lt-vdash); }
 .lean-tex-diff-added, .lean-tex-diff-removed {
   border-radius: 4px 4px 2px 2px;
   animation: lean-tex-fade .3s ease;
@@ -346,9 +351,9 @@ function buildLatex(lines, mvarId, vc, folds) {
   const sources = lines.map((line, li) => {
     const tex = line.map((part, pi) => {
       const ids = /* @__PURE__ */ new Map();
-      const go = (tt) => {
+      const go = (tt, autoFold = true) => {
         if ("text" in tt) return tt.text;
-        if ("append" in tt) return tt.append.map(go).join("");
+        if ("append" in tt) return tt.append.map((a) => go(a, autoFold)).join("");
         const [info, sub] = tt.tag;
         const pos = info.subexprPos ?? "/";
         const idKey = (info.binder ? "b" : "") + pos;
@@ -360,15 +365,20 @@ function buildLatex(lines, mvarId, vc, folds) {
           const loc = info.binder ? void 0 : partLocation(part, pos, mvarId);
           const key = loc ? JSON.stringify(loc) : `${li}/${pi}/${idKey}`;
           const color = info.fvarId != null ? varNumber(vc, info.fvarId, stripTags(sub)) : void 0;
-          const folded = folds.get(key) ?? info.omitted != null;
+          const folded = folds.get(key) ?? (autoFold && info.omitted != null);
           tags.push({ id, info, part, loc, key, color, folded });
         }
         const tag = tags[id];
         if (tag.folded) return first ? `\\class{lean-se-${id}}{\\class{lean-fold}{\\cdots}}` : "";
-        const inner = tag.color !== void 0 ? `\\class{lean-var-${tag.color}}{${go(sub)}}` : go(sub);
+        const colored = tag.color !== void 0 && part.kind !== "hyp";
+        const subAutoFold = autoFold && folds.get(tag.key) !== false;
+        const inner = colored ? `\\class{lean-var-${tag.color}}{${go(sub, subAutoFold)}}` : go(sub, subAutoFold);
         return `\\class{lean-se-${id}}{${inner}}`;
       };
-      return go(part.latex);
+      const tex2 = go(part.latex);
+      if (part.kind === "hyp") return `\\class{${part.inaccessible ? "lean-hyp-inaccessible" : "lean-hyp"}}{${tex2}}`;
+      if (part.kind === "turnstile") return `\\class{lean-vdash}{${tex2}}`;
+      return tex2;
     }).join("");
     return `$\\displaystyle ${tex}$`;
   });

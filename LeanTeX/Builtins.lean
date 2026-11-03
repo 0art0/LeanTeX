@@ -38,7 +38,7 @@ def Lean.FVarId.toLatex (fvarid : FVarId) : MetaM String :=
   try return (← fvarid.getDecl).userName.simpMacroScopes.toLatex
   catch _ =>
     -- loose free variable, use internal name
-    pure s!"\\operatorname\{FVar}[\\text\{{fvarid.name}}]"
+    pure s!"\\operatorname\{FVar}[{LeanTeX.latexText (toString fvarid.name)}]"
 
 namespace LeanTeX
 
@@ -46,9 +46,14 @@ namespace LeanTeX
 latex_pp_rules (kind := mdata)
   | Expr.mdata _ e => latexPP e
 
-/-- `LatexPrinter` for free variables. -/
+/-- `LatexPrinter` for free variables. Inaccessible variables (`n✝` in the goal view) are shown
+as `n^\dagger`. -/
 latex_pp_rules (kind := fvar)
-  | Expr.fvar fvarId => return LatexData.atomString (← fvarId.toLatex)
+  | Expr.fvar fvarId => do
+    if let some decl := (← getLCtx).find? fvarId then
+      if decl.userName.hasMacroScopes then
+        return .Atom decl.userName.eraseMacroScopes.toLatex 0 (some (.atomString "\\dagger")) none
+    return LatexData.atomString (← fvarId.toLatex)
 
 namespace Extra
 /-- `LatexPrinter` for metavariables. These print using the `userName` prefixed with "?".
@@ -70,7 +75,7 @@ latex_pp_rules (kind := lit)
 /-- Default `LatexPrinter` for constants. Specific constants can have more specialized printers.
 See `latex_pp_const_rule`. -/
 latex_pp_rules (kind := const)
-  | Expr.const c _ => return LatexData.atomString (← maybeWithTooltip s!"\\text\{{c}}" c.toString)
+  | Expr.const c _ => return LatexData.atomString (← maybeWithTooltip (latexText c.toString) c.toString)
 
 /-- Pretty print type universes, printing all `Type _` as `Type`. `Sort` is the union of `Prop` and `Type`. -/
 latex_pp_rules (kind := sort)

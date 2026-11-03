@@ -16,6 +16,9 @@ the current goal. Subexpressions in the display behave like those in the goal vi
   hovering;
 * the hover shows the subexpression and its type in LaTeX, and is itself interactive, so hovers
   can be nested. The TeX/Lean switch in a hover shows them in Lean syntax instead (remembered);
+* for `texify`, the colors follow the goal view: hypothesis names use its hypothesis-name color
+  (dimmed for inaccessible hypotheses, which are shown as `x^\dagger` for the goal view's `x✝`) and
+  `⊢` its turnstile color;
 * variables (including bound variables, also where they are bound) are colored, each with its own
   color, consistently across the display and its hovers. The colors adapt to the editor theme;
   `set_option leantex.colorVariables false` turns this off, and
@@ -24,7 +27,8 @@ the current goal. Subexpressions in the display behave like those in the goal vi
   of the variables: hovering a variable there highlights it, and clicking it picks its color
   (remembered by name);
 * Alt-clicking a subexpression folds it to `⋯` (as does the fold button in its hover), and clicking
-  `⋯` unfolds it. As in the goal view, proofs and very deep terms start out folded, following
+  `⋯` unfolds it, together with the terms folded automatically inside it. As in the goal view,
+  proofs and very deep terms start out folded, following
   `pp.proofs` and `pp.deepTerms`;
 * for `texify`, what the last tactic changed is highlighted, as in the goal view (following
   `showTacticDiff`), and the history button shows the goal before that tactic, with what it

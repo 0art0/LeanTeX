@@ -87,6 +87,22 @@ processing binders. Concretely, `m` is executed with `extraNames` appended to `a
 def withAvoidNames (extraNames : List Name) (m : LatexPrinterM α) : LatexPrinterM α :=
   ReaderT.adapt (λ state => { state with avoidNames := extraNames ++ state.avoidNames }) m
 
+/-- Escapes the characters of `s` that are special in LaTeX text mode, for use in `\text{...}`.
+For example, names such as `of_decide_eq_true` contain underscores, which are errors in text mode
+(also in MathJax with its `textmacros` package, which the infoview uses). -/
+def escapeLatexText (s : String) : String :=
+  s.foldl (init := "") fun acc c =>
+    acc ++ match c with
+      | '\\' => "\\textbackslash{}"
+      | '^' => "\\textasciicircum{}"
+      | '~' => "\\textasciitilde{}"
+      | '{' | '}' | '#' | '$' | '%' | '&' | '_' => "\\" ++ c.toString
+      | c => c.toString
+
+/-- `s` as LaTeX text, escaping special characters (see `escapeLatexText`). -/
+def latexText (s : String) : String :=
+  s!"\\text\{{escapeLatexText s}}"
+
 /-- Builds a string with given tooltip if the current configuration allows tooltip,
 returns the original string otherwise. -/
 def maybeWithTooltip (s tooltip : String) : LatexPrinterM String := do

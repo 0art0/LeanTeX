@@ -344,7 +344,7 @@ in some LaTeX to make it clear this was not handled. Mainly used for debugging p
 def defaultLatexPP (e : Expr) : LatexPrinterM LatexData := do
   let f ← PrettyPrinter.ppExpr e
   -- TODO try to do `Format` -> reasonable latex.
-  return LatexData.ofString <| s!"\\operatorname\{Lean}\\left[\\text\{{f}}\\right]"
+  return LatexData.ofString <| s!"\\operatorname\{Lean}\\left[{latexText (toString f)}\\right]"
 
 /-- For the given kind (as in `getExprKind`), run the associated pretty printer.
 

@@ -133,3 +133,9 @@ variable (X : Type) (U : Set X) (x : X)
 
 /-- info: \text{Prod.mk}(1) -/
 #guard_msgs in #latex Prod.mk 1
+
+-- Text-mode special characters in names are escaped, since `_` is an error in `\text{...}`
+-- (also in MathJax with `textmacros`, as in the infoview).
+def my_fun_name : Nat → Nat := id
+/-- info: \text{my\_fun\_name}(1) -/
+#guard_msgs in #latex my_fun_name 1
