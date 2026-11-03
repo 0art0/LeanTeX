@@ -284,6 +284,20 @@ def withBindingBodyUnusedName (e : Expr) (d : Name → Expr → LatexPrinterM α
     let body := e.bindingBody!.instantiate1 fvar
     withBindingBodyPos e fvar body (d n body)
 
+/-- Tags `d`, the LaTeX for the name of a variable where it is bound (as in `\forall x`),
+with that variable, so that the interactive display treats it like the variable's occurrences.
+`name` is the name that `withBindingBodyUnusedName` passed to the printer for the binder's body,
+and this must be called from within that printer. -/
+def withBinderTag (name : Name) (d : LatexData) : LatexPrinterM LatexData := do
+  unless (← read).tagSubexprs do return d
+  let lctx ← getLCtx
+  let isBinder (fvar : Expr) : Bool :=
+    fvar.isFVar && (lctx.find? fvar.fvarId!).any (·.userName == name)
+  let some (pos, fvar) := (← read).binderFVars.reverse.find? (isBinder ·.2) | return d
+  let tag := (← get).tags.size
+  modify fun s => { s with tags := s.tags.push { expr := fvar, pos, lctx, binder := true } }
+  return .Tagged tag d
+
 /-- Given an expression that is a function, ensure it is an `Expr.lam` by doing 1-variable
 eta expansion as needed.
 If provided, the `suggestion?` argument gives the name for the new argument to the lambda, and otherwise

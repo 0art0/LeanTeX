@@ -27,6 +27,12 @@ partial def String.toLatex (s : String) : String :=
 unicode characters by LaTeX commands. -/
 def Lean.Name.toLatex (n : Name) : String := (toString n).toLatex
 
+/-- The LaTeX for the name of a variable where it is bound (as in `\forall x`), for use in the
+printer passed to `LeanTeX.withBindingBodyUnusedName`, which provides `name`.
+In the interactive display, it behaves like the variable's occurrences (see `LeanTeX.withBinderTag`). -/
+def LeanTeX.binderLatex (name : Name) : LeanTeX.LatexPrinterM LeanTeX.LatexData :=
+  LeanTeX.withBinderTag name (.atomString name.toLatex)
+
 /-- Give a LaTeX-suitable representation of the local variable. -/
 def Lean.FVarId.toLatex (fvarid : FVarId) : MetaM String :=
   try return (← fvarid.getDecl).userName.simpMacroScopes.toLatex
@@ -75,16 +81,16 @@ latex_pp_rules (kind := sort)
     | .succ _ => return LatexData.atomString "\\mathbf{Type}"
     | _       => return LatexData.atomString "\\mathbf{Sort}"
 
-private partial def collectLambdaArgs : Expr → Array (Name × LatexData) → LatexPrinterM (Array (Name × LatexData) × LatexData)
+private partial def collectLambdaArgs : Expr → Array (LatexData × LatexData) → LatexPrinterM (Array (LatexData × LatexData) × LatexData)
   | e@(.lam ..), args =>
     withBindingBodyUnusedName e fun name body => do
-      collectLambdaArgs body (args.push (name, ← latexPP e.bindingDomain!))
+      collectLambdaArgs body (args.push (← binderLatex name, ← latexPP e.bindingDomain!))
   | e, args => do return (args, ← latexPP e)
 
 /-- `LatexPrinter` for `λ`-abstractions. For instance `λ x : ℝ => x^2` is rendered as `(x : ℝ) ↦ x^2`. -/
 latex_pp_rules (kind := lam) | e => do
   let (args, body) ← collectLambdaArgs e #[]
-  let pargs := LatexData.intercalate ", " <| args.map (λ (name, type) => LatexData.ofString name.toLatex ++ " : " ++ type)
+  let pargs := LatexData.intercalate ", " <| args.map (λ (name, type) => name ++ " : " ++ type)
   return pargs.parens ++ LatexData.nonAssocOp " \\mapsto " 0 ++ body
 
 /-- Simple implementation. Doesn't collect anything at all, compared to `pp_lam`. -/
@@ -106,7 +112,7 @@ latex_pp_rules (kind := forallE) | e => do
       withBindingBodyUnusedName e fun name body => do
         let pbody ← latexPP body
         let binder := if (← read).omitBinders then LatexData.atomString "" else " : " ++ pdom.resetBP .Infinity .Infinity
-        let pall := s!"\\forall {name.toLatex}" ++ binder ++ ",\\ " ++ pbody
+        let pall := "\\forall " ++ (← binderLatex name) ++ binder ++ ",\\ " ++ pbody
         return pall |>.resetBP (lbp := .Infinity) |>.mergeBP (rbp := .NonAssoc 0)
   else
     if arrow? then
@@ -120,7 +126,7 @@ latex_pp_rules (kind := forallE) | e => do
       withBindingBodyUnusedName e fun name body => do
         let pbody ← latexPP body
         let binder := if (← read).omitBinders then LatexData.atomString "" else " : " ++ pdom.resetBP .Infinity .Infinity
-        let ppi := s!"\\prod_\{{name.toLatex}" ++ binder ++ "} " ++ pbody.protect 30
+        let ppi := "\\prod_{" ++ (← binderLatex name) ++ binder ++ "} " ++ pbody.protect 30
         return ppi |>.resetBP (lbp := .Infinity) |>.mergeBP (rbp := .Assoc 30)
 
 /-- The binding power of function applications. -/
@@ -185,7 +191,7 @@ latex_pp_app_rules (const := Exists)
     let pdom ← latexPP α
     withBindingBodyUnusedName' p `x fun name body => do
       let pbody ← latexPP body
-      let mut binder : LatexData := .atomString name.toLatex
+      let mut binder : LatexData ← binderLatex name
       if (← read).omitBinders then
         binder ← binder.maybeWithTooltip s!"in \\({pdom.latex.1}\\)"
       else
@@ -356,7 +362,7 @@ latex_pp_app_rules (const := Sigma)
   | _, #[α, f] => do
     let pα ← withExtraSmallness 2 <| latexPP α
     withBindingBodyUnusedName' f `i fun name body => do
-      let pbind : LatexData := LatexData.parens (name.toLatex ++ " : " ++ pα)
+      let pbind : LatexData := LatexData.parens ((← binderLatex name) ++ " : " ++ pα)
       let pbody ← latexPP body
       return pbind ++ LatexData.rightAssocOp " \\times " 35 ++ pbody.protectLeft 34
 

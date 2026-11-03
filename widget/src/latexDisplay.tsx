@@ -2,16 +2,23 @@
  * Client side of `LeanTeX.LatexDisplay`: lines of LaTeX, rendered with the infoview's MathJax,
  * whose subexpressions can be interacted with like those of expressions in the goal view.
  *
- * The server sends each part of a line as `CodeWithInfos` whose leaves are LaTeX fragments.
+ * The server sends each part of a line as `TaggedText<LatexTag>` whose leaves are LaTeX fragments.
  * We give each tagged subexpression an id `N` and wrap its LaTeX in `\class{lean-se-N}{...}`.
  * MathJax (SVG output) puts the class on the `<g>` element for the subexpression, which is how we
  * find subexpressions on the page. Since in SVG only glyphs receive pointer events, we find the
  * subexpression under the pointer using bounding boxes, and since `<g>` elements have no
  * background, highlights are boxes drawn behind the formula.
  *
+ * Variables (free variables that are not proofs, including bound variables, which the server
+ * instantiates) are colored: we wrap them in `\class{lean-var-K}{...}` and set `fill` for that class.
+ * The colors are assigned in order of first appearance and shared with nested formulas
+ * (`VarColorsContext`), so a variable has the same color in the display and in its hovers.
+ *
  * The interactions follow the infoview's `InteractiveCode` (see `interactiveCode.tsx`,
  * `tooltips.tsx`, `hoverHighlight.tsx` and `goalLocation.tsx` in vscode-lean4):
- * - hovering highlights the innermost subexpression and shows its type and docstring after a delay;
+ * - hovering highlights the innermost subexpression and every other occurrence of it, and shows
+ *   its type and docstring after a delay. The type is rendered in LaTeX by the server
+ *   (`LeanTeX.LatexDisplay.popup`) and is itself interactive, so hovers nest;
  * - clicking pins that tooltip, and clicking elsewhere closes it;
  * - Ctrl/⌘-hovering underlines subexpressions that have a definition to go to,
  *   and Ctrl/⌘-clicking goes there;
@@ -24,7 +31,6 @@
 import * as React from 'react'
 import * as ReactDOM from 'react-dom'
 import {
-  CodeWithInfos,
   DocumentPosition,
   EditorContext,
   GoalLocation,
@@ -41,37 +47,322 @@ import {
   useRpcSession,
 } from '@leanprover/infoview'
 
+/** A reference to the server's information about a subexpression. */
+type InfoRef = SubexprInfo['info']
+
+/** Mirrors `LeanTeX.LatexTag`. */
+interface LatexTag {
+  info: InfoRef
+  subexprPos?: string | null
+  binder?: boolean
+  fvarId?: string | null
+  key: string
+}
+
+/** Mirrors `LeanTeX.LatexCode`. */
+type LatexCode = TaggedText<LatexTag>
+
 /** Mirrors `LeanTeX.LatexPart`. */
 interface LatexPart {
-  latex: CodeWithInfos
+  latex: LatexCode
   kind: 'text' | 'expr' | 'hyp' | 'hypType' | 'hypValue' | 'target'
-  fvarId?: string
-  name?: string
+  fvarId?: string | null
+  name?: string | null
 }
 
 /** Mirrors `LeanTeX.LatexDisplay.Props`. `pos` is added by ProofWidgets. */
 interface LatexDisplayProps {
   lines: LatexPart[][]
   mvarId?: string
+  colorVariables?: boolean
+  variableColors?: string[]
   pos: DocumentPosition
 }
+
+/** Mirrors `LeanTeX.LatexPopup`. */
+interface LatexPopup {
+  expr: LatexCode
+  type?: LatexCode | null
+  doc?: string | null
+}
+
+// ---------------------------------------------------------------------------------------------
+// Variable colors
+
+/** The default colors for variables: VS Code's chart colors, which are chosen to be legible in
+ * the current color theme, with fallbacks for other editors. */
+const DEFAULT_PALETTE = [
+  'var(--vscode-charts-blue, #3794ff)',
+  'var(--vscode-charts-orange, #d18616)',
+  'var(--vscode-charts-purple, #b180d7)',
+  'var(--vscode-charts-green, #4fb36b)',
+  'var(--vscode-charts-red, #f14c4c)',
+  'var(--vscode-terminal-ansiCyan, #11a8cd)',
+  'var(--vscode-charts-yellow, #cca700)',
+  'var(--vscode-terminal-ansiMagenta, #bc3fbc)',
+]
+
+/** At most this many colors are used, since there is a CSS rule for each. */
+const MAX_COLORS = 64
+
+/** The colors of variables: `index` maps free variables to indices into `palette`, in order of
+ * first appearance (modulo the length of the palette). Nested formulas add their own variables. */
+interface VarColors {
+  palette: string[]
+  index: Map<string, number>
+}
+
+const VarColorsContext = React.createContext<VarColors>({ palette: [], index: new Map() })
+
+function makeVarColors(enabled: boolean, custom: string[]): VarColors {
+  const palette = enabled ? (custom.length > 0 ? custom : DEFAULT_PALETTE).slice(0, MAX_COLORS) : []
+  return { palette, index: new Map() }
+}
+
+function varColorIndex(vc: VarColors, fvarId: string): number | undefined {
+  if (vc.palette.length === 0) return undefined
+  let i = vc.index.get(fvarId)
+  if (i === undefined) {
+    i = vc.index.size
+    vc.index.set(fvarId, i)
+  }
+  return i % vc.palette.length
+}
+
+/** CSS variables for the palette, to set on the root of each formula. */
+function paletteStyle(vc: VarColors): React.CSSProperties {
+  const style: Record<string, string> = {}
+  vc.palette.forEach((c, i) => (style[`--lean-var-${i}`] = c))
+  return style as React.CSSProperties
+}
+
+// ---------------------------------------------------------------------------------------------
+// Styles
+
+const STYLE = `
+.lean-tex {
+  --lt-fg: var(--vscode-editor-foreground, currentColor);
+  --lt-accent: var(--vscode-focusBorder, #3b82f6);
+  --lt-link: var(--vscode-textLink-foreground, var(--lt-accent));
+  --lt-hairline: color-mix(in srgb, var(--lt-fg) 12%, transparent);
+  --lt-ease: cubic-bezier(.2, .8, .2, 1);
+  position: relative;
+  /* Keep the z-indices below local, so that tooltips (appended to the body) are painted above. */
+  isolation: isolate;
+}
+.lean-tex-math { position: relative; z-index: 1; }
+.lean-tex-line { padding: 2px 0; }
+.lean-tex-line p { margin: 0; }
+.lean-tex-line.lean-tex-target-line {
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--lt-hairline);
+}
+
+/* Highlights, drawn behind the formula. */
+.lean-tex-box { position: absolute; pointer-events: none; z-index: 0; border-radius: 5px; }
+.lean-tex-hover {
+  --lt-hl: var(--lt-fg);
+  background: color-mix(in srgb, var(--lt-hl) 9%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--lt-hl) 24%, transparent);
+  transition: left .16s var(--lt-ease), top .16s var(--lt-ease), width .16s var(--lt-ease),
+    height .16s var(--lt-ease), opacity .14s ease, background-color .14s ease, box-shadow .14s ease;
+}
+.lean-tex-hover.lean-tex-colored {
+  background: color-mix(in srgb, var(--lt-hl) 15%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--lt-hl) 50%, transparent);
+}
+.lean-tex-hover[data-instant] { transition: opacity .14s ease; }
+.lean-tex-occurrence {
+  --lt-hl: var(--lt-accent);
+  border-radius: 4px 4px 2px 2px;
+  background: color-mix(in srgb, var(--lt-hl) 11%, transparent);
+  box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--lt-hl) 70%, transparent);
+  animation: lean-tex-fade .16s ease;
+}
+.lean-tex-selected {
+  background: color-mix(in srgb, var(--lt-accent) 20%, transparent);
+  box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--lt-accent) 80%, transparent);
+}
+.lean-tex-underline { background: var(--lt-link); border-radius: 1px; }
+${Array.from({ length: MAX_COLORS }, (_, i) => `.lean-var-${i} { fill: var(--lean-var-${i}); color: var(--lean-var-${i}); }`).join('\n')}
+
+/* Toolbar */
+.lean-tex-toolbar {
+  position: absolute; top: 0; right: 0; z-index: 2;
+  display: flex; gap: 2px;
+  opacity: 0; transition: opacity .15s ease;
+}
+.lean-tex-display:hover > .lean-tex > .lean-tex-toolbar,
+.lean-tex-toolbar:focus-within { opacity: 1; }
+.lean-tex-icon-button {
+  all: unset; box-sizing: border-box; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 5px;
+  color: var(--lt-fg); opacity: .6;
+  transition: opacity .12s ease, background-color .12s ease;
+}
+.lean-tex-icon-button:hover { opacity: 1; background: color-mix(in srgb, var(--lt-fg) 10%, transparent); }
+.lean-tex-icon-button:focus-visible { outline: 1px solid var(--lt-accent); }
+
+/* Tooltips */
+.lean-tex-tooltip {
+  --lt-fg: var(--vscode-editorHoverWidget-foreground, var(--vscode-editor-foreground, currentColor));
+  --lt-tip-bg: var(--vscode-editorHoverWidget-background, var(--vscode-editor-background, Canvas));
+  --lt-tip-border: var(--vscode-editorHoverWidget-border, color-mix(in srgb, var(--lt-fg) 20%, transparent));
+  --lt-ease: cubic-bezier(.2, .8, .2, 1);
+  position: absolute; box-sizing: border-box;
+  display: flex; flex-direction: column;
+  width: max-content; max-width: min(34rem, calc(100vw - 20px));
+  color: var(--lt-fg);
+  /* Opaque even if the theme's hover background is translucent. */
+  background: linear-gradient(var(--lt-tip-bg), var(--lt-tip-bg)), var(--vscode-editor-background, Canvas);
+  border: 1px solid var(--lt-tip-border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px -8px rgba(0, 0, 0, .45), 0 3px 8px -2px rgba(0, 0, 0, .25);
+  animation: lean-tex-pop .16s var(--lt-ease);
+}
+.lean-tex-tooltip[data-placement="top"] { --lt-dy: 4px; }
+.lean-tex-tooltip[data-placement="bottom"] { --lt-dy: -4px; }
+.lean-tex-tooltip-arrow {
+  position: absolute; width: 9px; height: 9px;
+  background: linear-gradient(var(--lt-tip-bg), var(--lt-tip-bg)), var(--vscode-editor-background, Canvas);
+  border: 1px solid var(--lt-tip-border);
+  transform: rotate(45deg);
+}
+.lean-tex-tooltip[data-placement="top"] > .lean-tex-tooltip-arrow { bottom: -6px; border-top: none; border-left: none; }
+.lean-tex-tooltip[data-placement="bottom"] > .lean-tex-tooltip-arrow { top: -6px; border-bottom: none; border-right: none; }
+.lean-tex-tooltip-content {
+  position: relative; min-height: 0;
+  padding: 6px 10px; overflow-y: auto; overscroll-behavior: contain;
+}
+.lean-tex-popup-head { display: flex; align-items: flex-start; gap: 10px; }
+.lean-tex-popup-main { flex: 1; min-width: 0; overflow-x: auto; }
+.lean-tex-popup-tools {
+  flex: none; display: flex; align-items: center; gap: 2px; margin-top: 2px;
+  opacity: .45; transition: opacity .15s ease;
+}
+.lean-tex-tooltip-content:hover > * > .lean-tex-popup-head > .lean-tex-popup-tools,
+.lean-tex-popup-tools:focus-within { opacity: 1; }
+.lean-tex-popup-doc {
+  margin-top: 6px; padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--lt-fg) 14%, transparent);
+}
+.lean-tex-popup-doc p:first-child { margin-top: 0; }
+.lean-tex-popup-doc p:last-child { margin-bottom: 0; }
+.lean-tex-muted { opacity: .6; }
+.lean-tex-segmented {
+  display: inline-flex; padding: 1px; border-radius: 6px;
+  background: color-mix(in srgb, var(--lt-fg) 9%, transparent);
+  font-size: 10px; line-height: 16px; letter-spacing: .03em;
+}
+.lean-tex-segmented button {
+  all: unset; cursor: pointer; padding: 0 6px; border-radius: 5px; opacity: .6;
+  transition: opacity .12s ease, background-color .12s ease;
+}
+.lean-tex-segmented button:hover { opacity: .9; }
+.lean-tex-segmented button[aria-pressed="true"] {
+  opacity: 1;
+  background: var(--lt-tip-bg, var(--vscode-editor-background, Canvas));
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .25);
+}
+
+/* Selection list */
+.lean-tex-selection { margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--lt-hairline); }
+.lean-tex-selection-head {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 0.85em; letter-spacing: .04em; text-transform: uppercase;
+}
+.lean-tex-selection-head a { text-transform: none; letter-spacing: normal; }
+.lean-tex-selection-item {
+  display: flex; align-items: baseline; gap: 10px;
+  margin-top: 4px; padding: 2px 8px; border-radius: 6px;
+  border-left: 2px solid var(--lt-accent);
+  background: color-mix(in srgb, var(--lt-accent) 7%, transparent);
+}
+.lean-tex-selection-label { flex: none; font-size: 0.85em; opacity: .65; }
+
+@keyframes lean-tex-fade { from { opacity: 0; } }
+@keyframes lean-tex-pop { from { opacity: 0; transform: translateY(var(--lt-dy, 0)) scale(.985); } }
+@media (prefers-reduced-motion: reduce) {
+  .lean-tex-hover, .lean-tex-occurrence, .lean-tex-tooltip { transition: none; animation: none; }
+}
+`
+
+/** Adds the styles to the document. They are global, since tooltips are appended to the body. */
+function ensureStyles() {
+  const id = 'leantex-latex-display-styles'
+  let el = document.getElementById(id)
+  if (!el) {
+    el = document.createElement('style')
+    el.id = id
+    document.head.appendChild(el)
+  }
+  if (el.textContent !== STYLE) el.textContent = STYLE
+}
+
+// ---------------------------------------------------------------------------------------------
+// Preferences
+
+/** Whether hovers show the expression and its type in LaTeX or in Lean syntax. Shared by all
+ * hovers and remembered across sessions when possible. */
+type PopupMode = 'tex' | 'lean'
+const MODE_KEY = 'leantex.popupMode'
+let popupMode: PopupMode = (() => {
+  try {
+    return window.localStorage.getItem(MODE_KEY) === 'lean' ? 'lean' : 'tex'
+  } catch {
+    return 'tex'
+  }
+})()
+const popupModeListeners = new Set<(m: PopupMode) => void>()
+
+function usePopupMode(): [PopupMode, (m: PopupMode) => void] {
+  const [mode, setModeState] = React.useState(popupMode)
+  React.useEffect(() => {
+    popupModeListeners.add(setModeState)
+    return () => {
+      popupModeListeners.delete(setModeState)
+    }
+  }, [])
+  const setMode = React.useCallback((m: PopupMode) => {
+    popupMode = m
+    try {
+      window.localStorage.setItem(MODE_KEY, m)
+    } catch {
+      // Storage may be unavailable; the preference then lasts for this session.
+    }
+    popupModeListeners.forEach(l => l(m))
+  }, [])
+  return [mode, setMode]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Building the LaTeX
 
 /** A tagged subexpression. */
 interface Tag {
   id: number
-  info: SubexprInfo
+  info: LatexTag
   part: LatexPart
   /** The goal location, if the subexpression is part of a goal. */
   loc?: GoalsLocation
   /** Identifies the subexpression for selection. Like the goal view, we identify subexpressions
    * of goals by their location, so that the selection survives updates of the display. */
   key: string
+  /** For variables, the index of the color in the palette. */
+  color?: number
 }
 
-/** A location in a document, as returned by go-to-definition. */
-interface DocLocation {
-  uri: string
-  range: { start: { line: number; character: number } }
+/** The LaTeX for a formula, with its tags. */
+interface Built {
+  /** The MathJax source of each line. */
+  sources: string[]
+  /** Whether each line shows the target of a goal. */
+  targetLines: boolean[]
+  /** The LaTeX without tags. */
+  plain: string
+  tags: Tag[]
 }
 
 /** The location of a subexpression at `pos` in the given part, if the part is in a goal. */
@@ -80,15 +371,15 @@ function partLocation(part: LatexPart, pos: string, mvarId: string | undefined):
   let loc: GoalLocation
   switch (part.kind) {
     case 'hyp':
-      if (part.fvarId === undefined) return undefined
+      if (part.fvarId == null) return undefined
       loc = { hyp: part.fvarId }
       break
     case 'hypType':
-      if (part.fvarId === undefined) return undefined
+      if (part.fvarId == null) return undefined
       loc = { hypType: [part.fvarId, pos] }
       break
     case 'hypValue':
-      if (part.fvarId === undefined) return undefined
+      if (part.fvarId == null) return undefined
       loc = { hypValue: [part.fvarId, pos] }
       break
     case 'target':
@@ -100,14 +391,18 @@ function partLocation(part: LatexPart, pos: string, mvarId: string | undefined):
   return { mvarId, loc }
 }
 
+/** The LaTeX without tags. */
+function stripTags(tt: LatexCode): string {
+  if ('text' in tt) return tt.text
+  if ('append' in tt) return tt.append.map(stripTags).join('')
+  return stripTags(tt.tag[1])
+}
+
 /** Builds the MathJax source for each line, assigning ids to tagged subexpressions.
  * Subexpressions are identified by their part and position, since the server may tag
  * several pieces of LaTeX with the same subexpression (for example the base and subscript of
- * `x_i` when a superscript is added). Also returns the LaTeX without tags. */
-function buildLatex(
-  lines: LatexPart[][],
-  mvarId: string | undefined,
-): { sources: string[]; plain: string; tags: Tag[] } {
+ * `x_i` when a superscript is added). Variables are assigned colors from `vc`. */
+function buildLatex(lines: LatexPart[][], mvarId: string | undefined, vc: VarColors): Built {
   const tags: Tag[] = []
   const plainLines: string[] = []
   const sources = lines.map((line, li) => {
@@ -115,7 +410,7 @@ function buildLatex(
     const tex = line
       .map((part, pi) => {
         const ids = new Map<string, number>()
-        const go = (tt: TaggedText<SubexprInfo>): string => {
+        const go = (tt: LatexCode): string => {
           if ('text' in tt) {
             plainLine += tt.text
             return tt.text
@@ -123,15 +418,20 @@ function buildLatex(
           if ('append' in tt) return tt.append.map(go).join('')
           const [info, sub] = tt.tag
           const pos = info.subexprPos ?? '/'
-          let id = ids.get(pos)
+          // A binder's name is tagged with the binder's position, like the binder itself.
+          const idKey = (info.binder ? 'b' : '') + pos
+          let id = ids.get(idKey)
           if (id === undefined) {
             id = tags.length
-            ids.set(pos, id)
-            const loc = partLocation(part, pos, mvarId)
-            const key = loc ? JSON.stringify(loc) : `${li}/${pi}/${pos}`
-            tags.push({ id, info, part, loc, key })
+            ids.set(idKey, id)
+            const loc = info.binder ? undefined : partLocation(part, pos, mvarId)
+            const key = loc ? JSON.stringify(loc) : `${li}/${pi}/${idKey}`
+            const color = info.fvarId != null ? varColorIndex(vc, info.fvarId) : undefined
+            tags.push({ id, info, part, loc, key, color })
           }
-          return `\\class{lean-se-${id}}{${go(sub)}}`
+          const color = tags[id].color
+          const inner = color !== undefined ? `\\class{lean-var-${color}}{${go(sub)}}` : go(sub)
+          return `\\class{lean-se-${id}}{${inner}}`
         }
         return go(part.latex)
       })
@@ -139,13 +439,19 @@ function buildLatex(
     plainLines.push(plainLine)
     return `$\\displaystyle ${tex}$`
   })
-  return { sources, plain: plainLines.join('\n'), tags }
+  return {
+    sources,
+    targetLines: lines.map((line, i) => i > 0 && line.some(p => p.kind === 'target')),
+    plain: plainLines.join('\n'),
+    tags,
+  }
 }
 
 /** A short human-readable description of where a subexpression is. */
 function tagLabel(tag: Tag): string {
   const { part } = tag
   const pos = tag.info.subexprPos ?? '/'
+  if (tag.info.binder) return 'bound variable'
   switch (part.kind) {
     case 'hyp':
       return 'hypothesis'
@@ -160,6 +466,9 @@ function tagLabel(tag: Tag): string {
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Geometry
+
 function samePosition(p: DocumentPosition, q: DocumentPosition): boolean {
   return p.uri === q.uri && p.line === q.line && p.character === q.character
 }
@@ -173,9 +482,10 @@ function isModifierHeld(e: React.MouseEvent): boolean {
   return e.altKey || e.ctrlKey || e.shiftKey || e.metaKey
 }
 
-/** The elements showing the subexpression with the given id. */
+/** The elements showing the subexpression with the given id. We only look inside the SVG, in case
+ * MathJax also outputs (hidden) assistive MathML with the same classes. */
 function tagElements(root: Element | null, id: number): Element[] {
-  return root ? [...root.querySelectorAll(`.lean-se-${id}`)] : []
+  return root ? [...root.querySelectorAll(`svg .lean-se-${id}`)] : []
 }
 
 /** Finds the id of the innermost tagged subexpression at the given point.
@@ -188,7 +498,7 @@ function tagIdAt(x: number, y: number, root: Element | null): number | undefined
   if (!root) return undefined
   let best: number | undefined
   let bestArea = Infinity
-  root.querySelectorAll('[class*="lean-se-"]').forEach(el => {
+  root.querySelectorAll('svg [class*="lean-se-"]').forEach(el => {
     const r = el.getBoundingClientRect()
     if (x < r.left || x > r.right || y < r.top || y > r.bottom) return
     const area = r.width * r.height
@@ -230,42 +540,41 @@ function tagRect(root: Element | null, id: number): Rect | undefined {
   }
 }
 
+/** A box relative to an element. */
 interface Box {
-  key: string
   left: number
   top: number
   width: number
   height: number
-  className?: string
-  underline?: boolean
 }
 
-/** Computes highlight boxes, relative to `root`, for the subexpressions with the given ids. */
-function computeBoxes(root: HTMLElement, highlights: { id: number; className?: string; underline?: boolean }[]): Box[] {
-  const rootRect = root.getBoundingClientRect()
-  const boxes: Box[] = []
-  for (const { id, className, underline } of highlights) {
-    tagElements(root, id).forEach((el, i) => {
-      const r = el.getBoundingClientRect()
-      boxes.push({
-        key: `${className}-${underline}-${id}-${i}`,
-        left: r.left - rootRect.left,
-        top: r.top - rootRect.top,
-        width: r.width,
-        height: r.height,
-        className,
-        underline,
-      })
-    })
+/** The box of the subexpression with the given id relative to `origin`, padded a little. */
+function tagBox(origin: Element, math: Element | null, id: number, padX = 2, padY = 1): Box | undefined {
+  const r = tagRect(math, id)
+  if (!r) return undefined
+  const o = origin.getBoundingClientRect()
+  return {
+    left: r.left - o.left - padX,
+    top: r.top - o.top - padY,
+    width: r.right - r.left + 2 * padX,
+    height: r.bottom - r.top + 2 * padY,
   }
-  return boxes
 }
 
-/** Marks pointer events inside tooltips, so that the click-outside handler can ignore them.
- * React events propagate along the React tree, so this also covers tooltips that the infoview
- * opens from within our tooltips (which are portals, so not DOM descendants). */
-function markInsideTooltip(e: React.PointerEvent) {
-  ;(e.nativeEvent as any)._leanTexInTooltip = true
+// ---------------------------------------------------------------------------------------------
+// Tooltips
+
+/** Marks pointer events inside tooltips with the formulas owning the tooltips, so that a formula's
+ * click-outside handler can ignore clicks inside its own tooltips. React events propagate along the
+ * React tree, so a click in a nested tooltip is marked with the owners of all enclosing tooltips,
+ * and also tooltips that the infoview opens from within ours (which are portals) are covered. */
+function markInsideTooltip(e: React.PointerEvent, owner: string) {
+  const ev = e.nativeEvent as any
+  ;(ev._leanTexTooltipOwners ??= []).push(owner)
+}
+
+function tooltipOwners(e: PointerEvent): string[] {
+  return (e as any)._leanTexTooltipOwners ?? []
 }
 
 interface TooltipLayout {
@@ -277,8 +586,10 @@ interface TooltipLayout {
 }
 
 /** A tooltip like the infoview's: appended to the document body, placed above or below the anchor
- * (whichever has more space), with an arrow and a maximum height of 300px. */
+ * (whichever has more space), with an arrow and a maximum height of 300px. Tooltips are painted in
+ * the order they are opened, so nested tooltips are above their parents. */
 function Tooltip(props: {
+  owner: string
   anchor: () => Rect | undefined
   children: React.ReactNode
   onPointerEnter?: () => void
@@ -295,7 +606,7 @@ function Tooltip(props: {
     const a = anchorRef.current()
     const t = ref.current
     if (!a || !t || !contentRef.current) return
-    const offset = 8
+    const offset = 9
     const padding = 10
     const vw = document.documentElement.clientWidth
     const vh = window.innerHeight
@@ -308,7 +619,7 @@ function Tooltip(props: {
     const center = (a.left + a.right) / 2
     const left = Math.max(padding, Math.min(center - width / 2, vw - padding - width))
     const top = placement === 'top' ? a.top - offset - height : a.bottom + offset
-    const arrowX = Math.max(10, Math.min(center - left, width - 10))
+    const arrowX = Math.max(12, Math.min(center - left, width - 12))
     const newLayout = { left: left + window.scrollX, top: top + window.scrollY, maxHeight, placement, arrowX } as const
     setLayout(old => (JSON.stringify(old) === JSON.stringify(newLayout) ? old : newLayout))
   }, [])
@@ -329,37 +640,21 @@ function Tooltip(props: {
   const tooltip = (
     <div
       ref={ref}
-      className="tooltip"
+      className="lean-tex-tooltip"
+      data-placement={layout?.placement}
       style={{
-        position: 'absolute',
         left: layout?.left ?? 0,
         top: layout?.top ?? 0,
         maxHeight: layout?.maxHeight,
         visibility: layout ? 'visible' : 'hidden',
       }}
-      onPointerDownCapture={markInsideTooltip}
+      onPointerDownCapture={e => markInsideTooltip(e, props.owner)}
       onPointerEnter={props.onPointerEnter}
       onPointerLeave={props.onPointerLeave}
       onClick={props.onClick}
     >
-      {layout && (
-        <svg
-          width={14}
-          height={7}
-          style={{
-            position: 'absolute',
-            left: layout.arrowX - 7,
-            ...(layout.placement === 'top' ? { bottom: -7 } : { top: -7, transform: 'rotate(180deg)' }),
-          }}
-        >
-          <path
-            d="M0,0 L7,7 L14,0"
-            fill="var(--vscode-editorHoverWidget-background)"
-            stroke="var(--vscode-editorHoverWidget-border)"
-          />
-        </svg>
-      )}
-      <div ref={contentRef} className="tooltip-content">
+      {layout && <div className="lean-tex-tooltip-arrow" style={{ left: layout.arrowX - 5 }} />}
+      <div ref={contentRef} className="lean-tex-tooltip-content">
         {props.children}
       </div>
     </div>
@@ -368,94 +663,161 @@ function Tooltip(props: {
 }
 
 /** Like the infoview's `TypePopupContents`: the subexpression and its type, then its docstring. */
-function TypePopupContents({ info }: { info: SubexprInfo }) {
+function LeanPopupContents({ info, withDoc }: { info: InfoRef; withDoc?: boolean }) {
   const rs = useRpcSession()
-  const popup = useAsync<InfoPopup>(() => InteractiveDiagnostics_infoToInteractive(rs, info.info), [rs, info.info])
+  const popup = useAsync<InfoPopup>(() => InteractiveDiagnostics_infoToInteractive(rs, info), [rs, info])
+  return popup.state === 'resolved' ? (
+    <>
+      <div className="font-code tl pre-wrap">
+        {popup.value.exprExplicit && <InteractiveCode fmt={popup.value.exprExplicit} />} :{' '}
+        {popup.value.type && <InteractiveCode fmt={popup.value.type} />}
+      </div>
+      {withDoc && popup.value.doc && (
+        <div className="lean-tex-popup-doc">
+          <Markdown contents={popup.value.doc} />
+        </div>
+      )}
+    </>
+  ) : popup.state === 'rejected' ? (
+    <span className="lean-tex-muted">Error: {mapRpcError(popup.error).message}</span>
+  ) : (
+    <span className="lean-tex-muted">Loading…</span>
+  )
+}
+
+/** Fetches the hover contents for a subexpression, with the expression and its type in LaTeX. */
+function useLatexPopup(info: InfoRef) {
+  const rs = useRpcSession()
+  return useAsync<LatexPopup>(() => rs.call<InfoRef, LatexPopup>('LeanTeX.LatexDisplay.popup', info), [rs, info])
+}
+
+/** A formula built from LaTeX code from the server, using the variable colors in context. */
+function useBuiltFormula(lines: LatexPart[][] | undefined): Built | undefined {
+  const vc = React.useContext(VarColorsContext)
+  return React.useMemo(() => (lines ? buildLatex(lines, undefined, vc) : undefined), [lines, vc])
+}
+
+/** The hover for a subexpression: the subexpression and its type, rendered in LaTeX and
+ * interactive (so that hovers nest), or in Lean syntax; then its docstring. */
+function PopupContents({ info, depth }: { info: InfoRef; depth: number }) {
+  const [mode, setMode] = usePopupMode()
+  const popup = useLatexPopup(info)
+  const value = popup.state === 'resolved' ? popup.value : undefined
+  const lines = React.useMemo<LatexPart[][] | undefined>(
+    () =>
+      value && [
+        [
+          { latex: value.expr, kind: 'expr' },
+          ...(value.type
+            ? ([
+                { latex: { text: ' : ' }, kind: 'text' },
+                { latex: value.type, kind: 'expr' },
+              ] as LatexPart[])
+            : []),
+        ],
+      ],
+    [value],
+  )
+  const built = useBuiltFormula(lines)
+  const ec = React.useContext(EditorContext)
+  // If the server cannot render LaTeX (for example an older LeanTeX), show Lean syntax.
+  const showLean = mode === 'lean' || popup.state === 'rejected'
+
   return (
     <div className="tooltip-code-content">
-      {popup.state === 'resolved' ? (
-        <>
-          <div className="font-code tl pre-wrap">
-            {popup.value.exprExplicit && <InteractiveCode fmt={popup.value.exprExplicit} />} :{' '}
-            {popup.value.type && <InteractiveCode fmt={popup.value.type} />}
-          </div>
-          {popup.value.doc && (
-            <>
-              <hr />
-              <Markdown contents={popup.value.doc} />
-            </>
+      <div className="lean-tex-popup-head">
+        <div className="lean-tex-popup-main">
+          {showLean ? (
+            <LeanPopupContents info={info} withDoc={popup.state === 'rejected'} />
+          ) : built ? (
+            <InteractiveLatex built={built} depth={depth} />
+          ) : (
+            <span className="lean-tex-muted">Loading…</span>
           )}
-        </>
-      ) : popup.state === 'rejected' ? (
-        <>Error: {mapRpcError(popup.error).message}</>
-      ) : (
-        <>Loading..</>
+        </div>
+        <div className="lean-tex-popup-tools">
+          {value && !showLean && (
+            <button
+              className="lean-tex-icon-button codicon codicon-copy"
+              title="Copy LaTeX"
+              onClick={e => {
+                e.stopPropagation()
+                void ec.api.copyToClipboard(stripTags(value.expr))
+              }}
+            />
+          )}
+          <div className="lean-tex-segmented" role="group" aria-label="Notation">
+            <button aria-pressed={mode === 'tex'} title="Show in LaTeX" onClick={() => setMode('tex')}>
+              TeX
+            </button>
+            <button aria-pressed={mode === 'lean'} title="Show in Lean syntax" onClick={() => setMode('lean')}>
+              Lean
+            </button>
+          </div>
+        </div>
+      </div>
+      {value?.doc && (
+        <div className="lean-tex-popup-doc">
+          <Markdown contents={value.doc} />
+        </div>
       )}
     </div>
   )
 }
 
-/** A selected subexpression, shown in Lean syntax. */
-function SelectedExpr({ tag }: { tag: Tag }) {
-  const rs = useRpcSession()
-  const popup = useAsync<InfoPopup>(() => InteractiveDiagnostics_infoToInteractive(rs, tag.info.info), [rs, tag.info.info])
-  return (
-    <div className="font-code pre-wrap" data-location={tag.loc ? JSON.stringify(tag.loc) : undefined}>
-      <span style={{ opacity: 0.7 }} title={tag.loc ? JSON.stringify(tag.loc) : undefined}>
-        {tagLabel(tag)}
-      </span>
-      {': '}
-      {popup.state === 'resolved' && popup.value.exprExplicit ? (
-        <InteractiveCode fmt={popup.value.exprExplicit} />
-      ) : popup.state === 'rejected' ? (
-        `Error: ${mapRpcError(popup.error).message}`
-      ) : (
-        '...'
-      )}
-    </div>
-  )
-}
+// ---------------------------------------------------------------------------------------------
+// The interactive formula
 
 /** One rendered line. Memoized so that MathJax does not re-render when the highlight changes. */
-const MathLine = React.memo(function MathLine({ source }: { source: string }) {
-  return <Markdown contents={source} />
+const MathLine = React.memo(function MathLine({ source, target }: { source: string; target: boolean }) {
+  return (
+    <div className={target ? 'lean-tex-line lean-tex-target-line' : 'lean-tex-line'}>
+      <Markdown contents={source} />
+    </div>
+  )
 })
 
 const SHOW_DELAY = 500
 const HIDE_DELAY = 300
 
-/** Styles that cannot be given inline. */
-const STYLE = `
-.lean-tex-display .lean-tex-copy { opacity: 0; transition: opacity 0.1s; }
-.lean-tex-display:hover .lean-tex-copy { opacity: 0.6; }
-.lean-tex-display .lean-tex-copy:hover { opacity: 1; }
-`
+/** Selection state, owned by `LatexDisplay`. */
+interface Selection {
+  selected: string[]
+  setKeySelected: (key: string, act: boolean | ((wasSelected: boolean) => boolean)) => void
+}
 
-export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) {
+/** A location in a document, as returned by go-to-definition. */
+interface DocLocation {
+  uri: string
+  range: { start: { line: number; character: number } }
+}
+
+interface HoverBox extends Box {
+  color?: string
+  visible: boolean
+  /** Whether to move without animation (when appearing). */
+  instant: boolean
+}
+
+/** A formula with interactive subexpressions. Used for the display itself and, recursively,
+ * for the hovers of its subexpressions (`depth > 0`), which have no selection or context menu. */
+function InteractiveLatex(props: {
+  built: Built
+  depth: number
+  selection?: Selection
+  /** Prefix for context menu ids; enables the context menu. */
+  contextMenuId?: string
+  toolbar?: React.ReactNode
+}) {
+  const { built, depth, selection, contextMenuId, toolbar } = props
+  const { sources, targetLines, tags } = built
   const ec = React.useContext(EditorContext)
   const rs = useRpcSession()
-  const { sources, plain, tags } = React.useMemo(() => buildLatex(lines, mvarId), [lines, mvarId])
+  const vc = React.useContext(VarColorsContext)
   const rootRef = React.useRef<HTMLDivElement>(null)
   const mathRef = React.useRef<HTMLDivElement>(null)
-  // Prefix for the ids used in context menu actions.
-  const uid = 'leantex' + React.useId().replace(/[^a-zA-Z0-9]/g, '')
-
-  // Selection: keys of selected subexpressions. Like the goal view, the selection is cleared when
-  // the cursor moves, and otherwise survives updates of the display.
-  const [selected, setSelected] = React.useState<string[]>([])
-  const [prevPos, setPrevPos] = React.useState(pos)
-  if (!samePosition(pos, prevPos)) {
-    setPrevPos(pos)
-    setSelected([])
-  }
-  const setKeySelected = React.useCallback((key: string, act: boolean | ((wasSelected: boolean) => boolean)) => {
-    setSelected(sel => {
-      const wasSelected = sel.includes(key)
-      const isSelected = typeof act === 'function' ? act(wasSelected) : act
-      if (wasSelected === isSelected) return sel
-      return isSelected ? [...sel, key] : sel.filter(k => k !== key)
-    })
-  }, [])
+  const owner = React.useId()
+  const selected = selection?.selected ?? []
 
   // The hovered subexpression, and whether Ctrl/⌘ is held.
   const [hover, setHover] = React.useState<{ id: number; ctrl: boolean } | undefined>()
@@ -476,8 +838,8 @@ export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) 
   }, [tags])
 
   // Latest values, for callbacks registered with event emitters and timers.
-  const latest = React.useRef({ tags, rs, ec, selected })
-  latest.current = { tags, rs, ec, selected }
+  const latest = React.useRef({ tags, rs, ec })
+  latest.current = { tags, rs, ec }
 
   const fetchGoTo = React.useCallback(async (id: number): Promise<DocLocation | undefined> => {
     const cached = goTo.current.get(id)
@@ -590,7 +952,7 @@ export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) 
       return
     }
     if (e.shiftKey) {
-      setKeySelected(tags[id].key, on => !on)
+      selection?.setKeySelected(tags[id].key, on => !on)
       e.preventDefault()
       return
     }
@@ -609,7 +971,7 @@ export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) 
   React.useEffect(() => {
     if (!anyTooltip) return
     const onPointerDownAnywhere = (e: PointerEvent) => {
-      if ((e as any)._leanTexInTooltip) return
+      if (tooltipOwners(e).includes(owner)) return
       // The user might be clicking a scrollbar.
       if (e.target instanceof Element && e.target.tagName === 'HTML') return
       setNoDefTip(undefined)
@@ -620,42 +982,44 @@ export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) 
     }
     document.addEventListener('pointerdown', onPointerDownAnywhere)
     return () => document.removeEventListener('pointerdown', onPointerDownAnywhere)
-  }, [anyTooltip])
+  }, [anyTooltip, owner])
 
   // Context menu: VS Code reads `data-vscode-context` from the clicked element and its ancestors,
   // so we set it on the formula for the subexpression under the pointer.
   const onContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (contextMenuId === undefined) return
     const id = tagIdAt(e.clientX, e.clientY, mathRef.current)
     const context: Record<string, string> = { interactiveCodeTagId: '', selectableLocationId: '', unselectableLocationId: '' }
     if (id !== undefined) {
       const key = tags[id].key
-      context.interactiveCodeTagId = `${uid}|${id}`
-      if (selected.includes(key)) context.unselectableLocationId = `${uid}|${key}`
-      else context.selectableLocationId = `${uid}|${key}`
+      context.interactiveCodeTagId = `${contextMenuId}|${id}`
+      if (selection) {
+        if (selected.includes(key)) context.unselectableLocationId = `${contextMenuId}|${key}`
+        else context.selectableLocationId = `${contextMenuId}|${key}`
+      }
     }
     e.currentTarget.setAttribute('data-vscode-context', JSON.stringify(context))
     setTips([])
   }
+  const setKeySelected = selection?.setKeySelected
   React.useEffect(() => {
+    if (contextMenuId === undefined) return
     const h = ec.events.clickedContextMenu.on(action => {
-      if (action.entry === 'unselectAll' && action.id === uid) {
-        setSelected([])
-        return
-      }
       const sep = action.id.indexOf('|')
-      if (sep < 0 || action.id.slice(0, sep) !== uid) return
+      if (sep < 0 || action.id.slice(0, sep) !== contextMenuId) return
       const arg = action.id.slice(sep + 1)
       if (action.entry === 'goToDefinition') void execGoTo(parseInt(arg), true)
-      else if (action.entry === 'select') setKeySelected(arg, true)
-      else if (action.entry === 'unselect') setKeySelected(arg, false)
+      else if (action.entry === 'select') setKeySelected?.(arg, true)
+      else if (action.entry === 'unselect') setKeySelected?.(arg, false)
     })
     return () => h.dispose()
-  }, [ec, uid, execGoTo, setKeySelected])
+  }, [ec, contextMenuId, execGoTo, setKeySelected])
 
-  // Highlight boxes, recomputed when the highlighted subexpressions or the layout change.
+  // Highlights, recomputed when the highlighted subexpressions or the layout change.
   const selectedIds = tags.filter(t => selected.includes(t.key)).map(t => t.id)
   const underline = hover !== undefined && hover.ctrl && !!goTo.current.get(hover.id)
-  const [boxes, setBoxes] = React.useState<Box[]>([])
+  const [hoverBox, setHoverBox] = React.useState<HoverBox>()
+  const [boxes, setBoxes] = React.useState<{ key: string; className: string; box: Box; color?: string }[]>([])
   const [layoutVersion, setLayoutVersion] = React.useState(0)
   React.useEffect(() => {
     const root = rootRef.current
@@ -664,51 +1028,74 @@ export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) 
     obs.observe(root)
     return () => obs.disconnect()
   }, [])
+  const colorOf = (tag: Tag | undefined) => (tag?.color !== undefined ? vc.palette[tag.color] : undefined)
   const highlightKey = JSON.stringify([selectedIds, hover?.id, underline])
   React.useLayoutEffect(() => {
     const root = rootRef.current
+    const math = mathRef.current
     if (!root) return
-    const highlights: { id: number; className?: string; underline?: boolean }[] = selectedIds.map(id => ({
-      id,
-      className: 'highlight-selected',
-    }))
-    if (hover !== undefined) highlights.push({ id: hover.id, className: 'highlight' })
-    if (underline && hover !== undefined) highlights.push({ id: hover.id, underline: true })
-    setBoxes(computeBoxes(root, highlights))
+    const newBoxes: typeof boxes = []
+    for (const id of selectedIds) {
+      const box = tagBox(root, math, id)
+      if (box) newBoxes.push({ key: `sel-${id}`, className: 'lean-tex-selected', box })
+    }
+    const hovered = hover !== undefined ? tags[hover.id] : undefined
+    if (hovered) {
+      // The other occurrences of the hovered subexpression.
+      const color = colorOf(hovered)
+      for (const t of tags) {
+        if (t.id === hovered.id || t.info.key !== hovered.info.key) continue
+        const box = tagBox(root, math, t.id)
+        if (box) newBoxes.push({ key: `occ-${t.id}`, className: 'lean-tex-occurrence', box, color })
+      }
+      if (underline) {
+        const r = tagBox(root, math, hovered.id, 0, 0)
+        if (r) {
+          newBoxes.push({
+            key: `ul-${hovered.id}`,
+            className: 'lean-tex-underline',
+            box: { left: r.left, top: r.top + r.height - 1, width: r.width, height: 1.5 },
+          })
+        }
+      }
+      const box = tagBox(root, math, hovered.id)
+      if (box) setHoverBox(prev => ({ ...box, color, visible: true, instant: !prev?.visible }))
+    } else {
+      setHoverBox(prev => prev && { ...prev, visible: false, instant: false })
+    }
+    setBoxes(newBoxes)
   }, [highlightKey, sources, layoutVersion])
 
-  const selectedTags = selected
-    .map(key => tags.find(t => t.key === key))
-    .filter((t): t is Tag => t !== undefined)
-
   return (
-    <div
-      ref={rootRef}
-      className="lean-tex-display"
-      style={{ position: 'relative' }}
-      data-vscode-context={JSON.stringify(selected.length > 0 ? { selectedLocationsId: uid } : {})}
-      data-selected-locations={JSON.stringify(selectedTags.flatMap(t => (t.loc ? [t.loc] : [])))}
-    >
-      <style>{STYLE}</style>
+    <div ref={rootRef} className="lean-tex" style={paletteStyle(vc)}>
+      {hoverBox && (
+        <div
+          className={'lean-tex-box lean-tex-hover' + (hoverBox.color ? ' lean-tex-colored' : '')}
+          data-instant={hoverBox.instant ? '' : undefined}
+          style={{
+            left: hoverBox.left,
+            top: hoverBox.top,
+            width: hoverBox.width,
+            height: hoverBox.height,
+            opacity: hoverBox.visible ? 1 : 0,
+            ...(hoverBox.color ? ({ '--lt-hl': hoverBox.color } as React.CSSProperties) : {}),
+          }}
+        />
+      )}
       {boxes.map(b => (
         <div
           key={b.key}
-          className={b.className}
+          className={'lean-tex-box ' + b.className}
           style={{
-            position: 'absolute',
-            left: b.left,
-            top: b.underline ? b.top + b.height - 1 : b.top,
-            width: b.width,
-            height: b.underline ? 1 : b.height,
-            backgroundColor: b.underline ? 'var(--vscode-editor-foreground)' : undefined,
-            pointerEvents: 'none',
-            zIndex: 0,
+            ...b.box,
+            ...(b.color ? ({ '--lt-hl': b.color } as React.CSSProperties) : {}),
           }}
         />
       ))}
       <div
         ref={mathRef}
-        style={{ position: 'relative', zIndex: 1, cursor: hover !== undefined ? 'pointer' : undefined }}
+        className="lean-tex-math"
+        style={{ cursor: hover !== undefined ? 'pointer' : undefined }}
         onPointerMove={onPointerMove}
         onPointerLeave={onPointerLeave}
         onPointerDown={onPointerDown}
@@ -717,20 +1104,16 @@ export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) 
         onContextMenu={onContextMenu}
       >
         {sources.map((source, i) => (
-          <MathLine key={i} source={source} />
+          <MathLine key={i} source={source} target={targetLines[i]} />
         ))}
       </div>
-      <a
-        className="lean-tex-copy link pointer codicon codicon-copy"
-        title="Copy LaTeX"
-        style={{ position: 'absolute', top: 0, right: 0, zIndex: 2 }}
-        onClick={() => void ec.api.copyToClipboard(plain)}
-      />
+      {toolbar && <div className="lean-tex-toolbar">{toolbar}</div>}
       {tips.map(
         t =>
           tags[t.id] && (
             <Tooltip
               key={t.id}
+              owner={owner}
               anchor={() => tagRect(mathRef.current, t.id)}
               onPointerEnter={() => {
                 pointerOverTooltip.current = true
@@ -743,28 +1126,156 @@ export default function LatexDisplay({ lines, mvarId, pos }: LatexDisplayProps) 
               // Interacting with a tooltip (e.g. pinning a tooltip inside it) pins it.
               onClick={() => setTips(ts => ts.map(u => (u.id === t.id ? { ...u, pinned: true } : u)))}
             >
-              <TypePopupContents info={tags[t.id].info} />
+              <PopupContents info={tags[t.id].info.info} depth={depth + 1} />
             </Tooltip>
           ),
       )}
       {noDefTip !== undefined && (
-        <Tooltip anchor={() => tagRect(mathRef.current, noDefTip)} onClick={() => setNoDefTip(undefined)}>
+        <Tooltip owner={owner} anchor={() => tagRect(mathRef.current, noDefTip)} onClick={() => setNoDefTip(undefined)}>
           No definition found for this subexpression
         </Tooltip>
       )}
-      {selectedTags.length > 0 && (
-        <div className="mt2" style={{ position: 'relative', zIndex: 1 }}>
-          <div style={{ opacity: 0.7 }}>
-            Selected (shift-click to toggle){' '}
-            <a className="link pointer" onClick={() => setSelected([])}>
-              clear
-            </a>
-          </div>
-          {selectedTags.map(tag => (
-            <SelectedExpr key={tag.key} tag={tag} />
-          ))}
-        </div>
-      )}
     </div>
+  )
+}
+
+// ---------------------------------------------------------------------------------------------
+// The display
+
+/** A button that copies `text`, confirming with a check mark. */
+function CopyButton({ text, title }: { text: string; title: string }) {
+  const ec = React.useContext(EditorContext)
+  const [copied, setCopied] = React.useState(false)
+  React.useEffect(() => {
+    if (!copied) return
+    const t = window.setTimeout(() => setCopied(false), 1500)
+    return () => window.clearTimeout(t)
+  }, [copied])
+  return (
+    <button
+      className={'lean-tex-icon-button codicon ' + (copied ? 'codicon-check' : 'codicon-copy')}
+      title={copied ? 'Copied' : title}
+      onClick={() => {
+        void ec.api.copyToClipboard(text)
+        setCopied(true)
+      }}
+    />
+  )
+}
+
+/** A selected subexpression, in LaTeX (or Lean syntax, following the hover preference). */
+function SelectedExpr({ tag }: { tag: Tag }) {
+  const [mode] = usePopupMode()
+  const popup = useLatexPopup(tag.info.info)
+  const value = popup.state === 'resolved' ? popup.value : undefined
+  const lines = React.useMemo<LatexPart[][] | undefined>(() => value && [[{ latex: value.expr, kind: 'expr' }]], [value])
+  const built = useBuiltFormula(lines)
+  return (
+    <div className="lean-tex-selection-item" data-location={tag.loc ? JSON.stringify(tag.loc) : undefined}>
+      <span className="lean-tex-selection-label font-code" title={tag.loc ? JSON.stringify(tag.loc) : undefined}>
+        {tagLabel(tag)}
+      </span>
+      <div style={{ minWidth: 0, flex: 1 }}>
+        {mode === 'lean' || popup.state === 'rejected' ? (
+          <LeanExpr info={tag.info.info} />
+        ) : built ? (
+          <InteractiveLatex built={built} depth={1} />
+        ) : (
+          <span className="lean-tex-muted">…</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** A subexpression in Lean syntax. */
+function LeanExpr({ info }: { info: InfoRef }) {
+  const rs = useRpcSession()
+  const popup = useAsync<InfoPopup>(() => InteractiveDiagnostics_infoToInteractive(rs, info), [rs, info])
+  return (
+    <span className="font-code pre-wrap">
+      {popup.state === 'resolved' && popup.value.exprExplicit ? (
+        <InteractiveCode fmt={popup.value.exprExplicit} />
+      ) : popup.state === 'rejected' ? (
+        `Error: ${mapRpcError(popup.error).message}`
+      ) : (
+        '…'
+      )}
+    </span>
+  )
+}
+
+export default function LatexDisplay({ lines, mvarId, pos, colorVariables, variableColors }: LatexDisplayProps) {
+  const ec = React.useContext(EditorContext)
+  const colorsKey = JSON.stringify([colorVariables ?? true, variableColors ?? []])
+  // New colors for new contents, so that variables are colored in order of appearance.
+  const vc = React.useMemo(() => makeVarColors(colorVariables ?? true, variableColors ?? []), [colorsKey, lines])
+  const built = React.useMemo(() => buildLatex(lines, mvarId, vc), [lines, mvarId, vc])
+  const { plain, tags } = built
+  // Prefix for the ids used in context menu actions.
+  const uid = 'leantex' + React.useId().replace(/[^a-zA-Z0-9]/g, '')
+
+  React.useLayoutEffect(ensureStyles, [])
+
+  // Selection: keys of selected subexpressions. Like the goal view, the selection is cleared when
+  // the cursor moves, and otherwise survives updates of the display.
+  const [selected, setSelected] = React.useState<string[]>([])
+  const [prevPos, setPrevPos] = React.useState(pos)
+  if (!samePosition(pos, prevPos)) {
+    setPrevPos(pos)
+    setSelected([])
+  }
+  const setKeySelected = React.useCallback((key: string, act: boolean | ((wasSelected: boolean) => boolean)) => {
+    setSelected(sel => {
+      const wasSelected = sel.includes(key)
+      const isSelected = typeof act === 'function' ? act(wasSelected) : act
+      if (wasSelected === isSelected) return sel
+      return isSelected ? [...sel, key] : sel.filter(k => k !== key)
+    })
+  }, [])
+  const selection = React.useMemo(() => ({ selected, setKeySelected }), [selected, setKeySelected])
+
+  React.useEffect(() => {
+    const h = ec.events.clickedContextMenu.on(action => {
+      if (action.entry === 'unselectAll' && action.id === uid) setSelected([])
+    })
+    return () => h.dispose()
+  }, [ec, uid])
+
+  const selectedTags = selected
+    .map(key => tags.find(t => t.key === key))
+    .filter((t): t is Tag => t !== undefined)
+
+  return (
+    <VarColorsContext.Provider value={vc}>
+      <div
+        className="lean-tex-display"
+        data-vscode-context={JSON.stringify(selected.length > 0 ? { selectedLocationsId: uid } : {})}
+        data-selected-locations={JSON.stringify(selectedTags.flatMap(t => (t.loc ? [t.loc] : [])))}
+      >
+        <InteractiveLatex
+          built={built}
+          depth={0}
+          selection={selection}
+          contextMenuId={uid}
+          toolbar={<CopyButton text={plain} title="Copy LaTeX" />}
+        />
+        {selectedTags.length > 0 && (
+          <div className="lean-tex-selection lean-tex">
+            <div className="lean-tex-selection-head lean-tex-muted">
+              <span>Selected</span>
+              <span>·</span>
+              <a className="link pointer" onClick={() => setSelected([])}>
+                clear
+              </a>
+              <span style={{ textTransform: 'none', letterSpacing: 'normal' }}>(shift-click to toggle)</span>
+            </div>
+            {selectedTags.map(tag => (
+              <SelectedExpr key={tag.key} tag={tag} />
+            ))}
+          </div>
+        )}
+      </div>
+    </VarColorsContext.Provider>
   )
 }

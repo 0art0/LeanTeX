@@ -44,7 +44,14 @@ elab tk:"#latex_tags " e:term : command => do
       let some tag := tags[t]? | throwError "unknown tag {t}"
       let some raw := rawSubexpr? e tag.pos | throwError "bad position {tag.pos}"
       let status ←
-        if raw == tag.expr then pure ""
+        if tag.binder then
+          -- The name of a bound variable: `pos` is the binder, and `expr` the variable.
+          unless raw.consumeMData.isBinding && tag.expr.isFVar do
+            throwError "binder tag {t} at {tag.pos}: {tag.expr} is not a variable bound by {raw}"
+          let some decl := tag.lctx.find? tag.expr.fvarId! | throwError "unknown variable"
+          lines := lines.push s!"{tag.pos} binder {decl.userName}"
+          continue
+        else if raw == tag.expr then pure ""
         else if raw.hasLooseBVars && raw.approxDepth == tag.expr.approxDepth then pure " (inst)"
         else throwError "tag {t} at {tag.pos}: {tag.expr} is not {raw}"
       let s ← Meta.withLCtx tag.lctx {} do pure s!"{tag.pos} {← Meta.ppExpr tag.expr}{status}"
@@ -109,8 +116,9 @@ info: \class{lean-se-0}{\class{lean-se-1}{\text{f}}(\class{lean-se-2}{\class{lea
 #guard_msgs in
 #latex_tags f (a + b) 2
 /--
-info: \class{lean-se-0}{\forall y : \class{lean-se-1}{\mathbb{N}},\ \class{lean-se-2}{\class{lean-se-3}{\class{lean-se-4}{y} + \class{lean-se-5}{b}} = \class{lean-se-6}{\class{lean-se-7}{b} + \class{lean-se-8}{y}}}}
+info: \class{lean-se-0}{\forall \class{lean-se-9}{y} : \class{lean-se-1}{\mathbb{N}},\ \class{lean-se-2}{\class{lean-se-3}{\class{lean-se-4}{y} + \class{lean-se-5}{b}} = \class{lean-se-6}{\class{lean-se-7}{b} + \class{lean-se-8}{y}}}}
 / ∀ (y : Nat), y + b = b + y
+/ binder y
 /0 Nat
 /1 y + b = b + y (inst)
 /1/0/1 y + b (inst)
@@ -123,16 +131,19 @@ info: \class{lean-se-0}{\forall y : \class{lean-se-1}{\mathbb{N}},\ \class{lean-
 #guard_msgs in
 #latex_tags ∀ y : Nat, y + b = b + y
 /--
-info: \class{lean-se-0}{\forall y : \class{lean-se-1}{\mathbb{N}},\ \class{lean-se-2}{\forall z : \class{lean-se-3}{\mathbb{N}},\ \class{lean-se-4}{\class{lean-se-5}{\class{lean-se-6}{y} \leq \class{lean-se-7}{z}} \implies \class{lean-se-8}{\exists w : \class{lean-se-9}{\mathbb{N}},\ \class{lean-se-10}{\class{lean-se-11}{\class{lean-se-12}{y} + \class{lean-se-13}{w}} = \class{lean-se-14}{z}}}}}}
+info: \class{lean-se-0}{\forall \class{lean-se-17}{y} : \class{lean-se-1}{\mathbb{N}},\ \class{lean-se-2}{\forall \class{lean-se-16}{z} : \class{lean-se-3}{\mathbb{N}},\ \class{lean-se-4}{\class{lean-se-5}{\class{lean-se-6}{y} \leq \class{lean-se-7}{z}} \implies \class{lean-se-8}{\exists \class{lean-se-15}{w} : \class{lean-se-9}{\mathbb{N}},\ \class{lean-se-10}{\class{lean-se-11}{\class{lean-se-12}{y} + \class{lean-se-13}{w}} = \class{lean-se-14}{z}}}}}}
 / ∀ (y z : Nat), y ≤ z → ∃ w, y + w = z
+/ binder y
 /0 Nat
 /1 ∀ (z : Nat), y ≤ z → ∃ w, y + w = z (inst)
+/1 binder z
 /1/0 Nat
 /1/1 y ≤ z → ∃ w, y + w = z (inst)
 /1/1/0 y ≤ z (inst)
 /1/1/0/0/1 y (inst)
 /1/1/0/1 z (inst)
 /1/1/1 ∃ w, y + w = z (inst)
+/1/1/1/1 binder w
 /1/1/1/1/0 Nat
 /1/1/1/1/1 y + w = z (inst)
 /1/1/1/1/1/0/1 y + w (inst)
@@ -143,9 +154,11 @@ info: \class{lean-se-0}{\forall y : \class{lean-se-1}{\mathbb{N}},\ \class{lean-
 #guard_msgs in
 #latex_tags ∀ y z : Nat, y ≤ z → ∃ w, y + w = z
 /--
-info: \class{lean-se-0}{(y : \class{lean-se-1}{\mathbb{N}}, z : \class{lean-se-2}{\mathbb{N}}) \mapsto \class{lean-se-3}{\class{lean-se-4}{\class{lean-se-5}{y} + \class{lean-se-6}{z}} + \class{lean-se-7}{b}}}
+info: \class{lean-se-0}{(\class{lean-se-1}{y} : \class{lean-se-2}{\mathbb{N}}, \class{lean-se-3}{z} : \class{lean-se-4}{\mathbb{N}}) \mapsto \class{lean-se-5}{\class{lean-se-6}{\class{lean-se-7}{y} + \class{lean-se-8}{z}} + \class{lean-se-9}{b}}}
 / fun y z => y + z + b
+/ binder y
 /0 Nat
+/1 binder z
 /1/0 Nat
 /1/1 y + z + b (inst)
 /1/1/0/1 y + z (inst)
@@ -176,10 +189,11 @@ info: \class{lean-se-0}{\frac{\class{lean-se-1}{\class{lean-se-2}{b} + \class{le
 #guard_msgs in
 #latex_tags (b + 1) / (b - 1)
 /--
-info: \class{lean-se-0}{\class{lean-se-1}{\mathbb{N}} \times \class{lean-se-2}{(n : \class{lean-se-3}{\mathbb{N}}) \times \class{lean-se-4}{\class{lean-se-5}{\mathbb{N}_{< \class{lean-se-6}{n}}} \times \class{lean-se-7}{\mathbb{N}}}}}
+info: \class{lean-se-0}{\class{lean-se-1}{\mathbb{N}} \times \class{lean-se-2}{(\class{lean-se-4}{n} : \class{lean-se-3}{\mathbb{N}}) \times \class{lean-se-5}{\class{lean-se-6}{\mathbb{N}_{< \class{lean-se-7}{n}}} \times \class{lean-se-8}{\mathbb{N}}}}}
 / Nat × (n : Nat) × Fin n × Nat
 /0/1 Nat
 /1 (n : Nat) × Fin n × Nat
+/1/1 binder n
 /1/1/0 Nat
 /1/1/1 Fin n × Nat (inst)
 /1/1/1/0/1 Fin n (inst)
@@ -189,8 +203,9 @@ info: \class{lean-se-0}{\class{lean-se-1}{\mathbb{N}} \times \class{lean-se-2}{(
 #guard_msgs in
 #latex_tags Nat × (n : Nat) × Fin n × Nat
 /--
-info: \class{lean-se-0}{\exists p : \class{lean-se-1}{\class{lean-se-2}{\mathbb{N}} \times \class{lean-se-3}{\mathbb{N}}},\ \class{lean-se-4}{\class{lean-se-5}{\class{lean-se-6}{\text{Prod.fst}}(\class{lean-se-7}{p})} = \class{lean-se-8}{b}}}
+info: \class{lean-se-0}{\exists \class{lean-se-9}{p} : \class{lean-se-1}{\class{lean-se-2}{\mathbb{N}} \times \class{lean-se-3}{\mathbb{N}}},\ \class{lean-se-4}{\class{lean-se-5}{\class{lean-se-6}{\text{Prod.fst}}(\class{lean-se-7}{p})} = \class{lean-se-8}{b}}}
 / ∃ p, p.fst = b
+/1 binder p
 /1/0 Nat × Nat
 /1/0/0/1 Nat
 /1/0/1 Nat

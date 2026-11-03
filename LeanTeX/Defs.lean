@@ -56,6 +56,10 @@ structure SubexprTag where
   pos : SubExpr.Pos
   /-- The local context in which `expr` makes sense. -/
   lctx : LocalContext
+  /-- Whether this tags the name of a bound variable where it is bound (as in `\forall x`) rather
+  than an occurrence of `expr`. Then `expr` is the free variable substituted for the bound variable
+  and `pos` is the position of the binder. See `LeanTeX.withBinderTag`. -/
+  binder : Bool := false
   deriving Inhabited
 
 /-- State for the `LatexPrinterM` monad. -/
