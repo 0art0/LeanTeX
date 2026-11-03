@@ -307,8 +307,10 @@ const STYLE = `
   background: color-mix(in srgb, var(--lt-accent) 7%, transparent);
 }
 .lean-fold { fill: var(--lt-accent); color: var(--lt-accent); }
-.lean-hyp { fill: var(--lt-hyp); color: var(--lt-hyp); }
-.lean-hyp-inaccessible { fill: var(--lt-hyp-inaccessible); color: var(--lt-hyp-inaccessible); opacity: .7; }
+/* Hypothesis names of variables keep the variable's color (MathJax may merge the classes). */
+.lean-hyp:not([class*="lean-var-"]) { fill: var(--lt-hyp); color: var(--lt-hyp); }
+.lean-hyp-inaccessible { opacity: .7; }
+.lean-hyp-inaccessible:not([class*="lean-var-"]) { fill: var(--lt-hyp-inaccessible); color: var(--lt-hyp-inaccessible); }
 .lean-vdash { fill: var(--lt-vdash); color: var(--lt-vdash); }
 .lean-tex-diff-added, .lean-tex-diff-removed {
   border-radius: 4px 4px 2px 2px;
@@ -570,8 +572,9 @@ function buildLatex(lines: LatexPart[][], mvarId: string | null | undefined, vc:
           }
           const tag = tags[id]
           if (tag.folded) return first ? `\\class{lean-se-${id}}{\\class{lean-fold}{\\cdots}}` : ''
-          // As in the goal view, hypothesis names have their own color rather than the variable's.
-          const colored = tag.color !== undefined && part.kind !== 'hyp'
+          // Hypothesis names of variables keep the variable's color. Other hypothesis names (proofs) get the
+          // goal view's color from the class around the part (see below).
+          const colored = tag.color !== undefined
           const subAutoFold = autoFold && folds.get(tag.key) !== false
           const inner = colored
             ? `\\class{lean-var-${tag.color}}{${go(sub, subAutoFold)}}`

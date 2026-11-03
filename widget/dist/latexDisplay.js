@@ -157,8 +157,10 @@ var STYLE = `
   background: color-mix(in srgb, var(--lt-accent) 7%, transparent);
 }
 .lean-fold { fill: var(--lt-accent); color: var(--lt-accent); }
-.lean-hyp { fill: var(--lt-hyp); color: var(--lt-hyp); }
-.lean-hyp-inaccessible { fill: var(--lt-hyp-inaccessible); color: var(--lt-hyp-inaccessible); opacity: .7; }
+/* Hypothesis names of variables keep the variable's color (MathJax may merge the classes). */
+.lean-hyp:not([class*="lean-var-"]) { fill: var(--lt-hyp); color: var(--lt-hyp); }
+.lean-hyp-inaccessible { opacity: .7; }
+.lean-hyp-inaccessible:not([class*="lean-var-"]) { fill: var(--lt-hyp-inaccessible); color: var(--lt-hyp-inaccessible); }
 .lean-vdash { fill: var(--lt-vdash); color: var(--lt-vdash); }
 .lean-tex-diff-added, .lean-tex-diff-removed {
   border-radius: 4px 4px 2px 2px;
@@ -370,7 +372,7 @@ function buildLatex(lines, mvarId, vc, folds) {
         }
         const tag = tags[id];
         if (tag.folded) return first ? `\\class{lean-se-${id}}{\\class{lean-fold}{\\cdots}}` : "";
-        const colored = tag.color !== void 0 && part.kind !== "hyp";
+        const colored = tag.color !== void 0;
         const subAutoFold = autoFold && folds.get(tag.key) !== false;
         const inner = colored ? `\\class{lean-var-${tag.color}}{${go(sub, subAutoFold)}}` : go(sub, subAutoFold);
         return `\\class{lean-se-${id}}{${inner}}`;
